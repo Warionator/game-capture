@@ -59,6 +59,7 @@ pub fn run() {
             commands::open_storage_folder,
             commands::rescan_library,
             commands::list_processes,
+            commands::list_audio_apps,
             commands::prepare_audio_tracks,
             commands::export_clip,
             commands::process_icon,

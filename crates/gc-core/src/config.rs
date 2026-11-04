@@ -585,6 +585,19 @@ pub struct AppTrack {
     pub source: AudioSource,
     /// Also mix this app into the master track.
     pub include_in_mix: bool,
+    /// Set when the track is an installed web app (PWA). Its sound is played
+    /// by the browser's shared audio process, so `executables` is the
+    /// browser and the track contains everything that browser plays.
+    pub web_app: Option<WebAppRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WebAppRef {
+    /// Chromium app id (from the window's `…_crx_<id>` AppUserModelID).
+    pub app_id: String,
+    /// "Microsoft Edge", "Google Chrome"…
+    pub browser: String,
 }
 
 impl Default for AppTrack {
@@ -594,6 +607,7 @@ impl Default for AppTrack {
             executables: Vec::new(),
             source: AudioSource::default(),
             include_in_mix: true,
+            web_app: None,
         }
     }
 }

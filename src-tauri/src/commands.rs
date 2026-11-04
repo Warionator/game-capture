@@ -236,6 +236,42 @@ pub async fn export_clip(
     .map_err(err)?
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioAppDto {
+    #[serde(flatten)]
+    pub app: process::AudioApp,
+    /// `data:image/png;base64,…`
+    pub icon: Option<String>,
+}
+
+/// Running apps and installed web apps for the "add application track"
+/// picker, apps that are playing sound first.
+#[tauri::command]
+pub async fn list_audio_apps() -> CmdResult<Vec<AudioAppDto>> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let sessions = gc_audio::audio_sessions();
+        process::audio_apps(&sessions)
+            .into_iter()
+            .map(|app| {
+                let icon = app
+                    .icon_path
+                    .as_deref()
+                    .and_then(|p| process::icon_png(p, 48))
+                    .map(|png| {
+                        format!(
+                            "data:image/png;base64,{}",
+                            base64::engine::general_purpose::STANDARD.encode(png)
+                        )
+                    });
+                AudioAppDto { app, icon }
+            })
+            .collect()
+    })
+    .await
+    .map_err(err)
+}
+
 #[tauri::command]
 pub fn list_processes() -> Vec<process::WindowedProcess> {
     process::windowed_processes()

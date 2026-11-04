@@ -55,6 +55,22 @@ pub fn list_input_devices() -> Vec<AudioDevice> {
     }
 }
 
+/// Processes with an audio session on the default playback device
+/// (`pid → actively playing`). Empty off Windows.
+pub fn audio_sessions() -> std::collections::HashMap<u32, bool> {
+    #[cfg(windows)]
+    {
+        wasapi::audio_sessions().unwrap_or_else(|e| {
+            log::debug!("enumerating audio sessions failed: {e}");
+            Default::default()
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        Default::default()
+    }
+}
+
 /// The default source factory for this platform.
 pub fn default_factory() -> std::sync::Arc<dyn SourceFactory> {
     #[cfg(windows)]

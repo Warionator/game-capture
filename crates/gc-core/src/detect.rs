@@ -177,6 +177,48 @@ const GRAPHICS_DLLS: &[&str] = &[
     "opengl32.dll",
 ];
 
+/// Chromium-based browsers that host installed web apps (PWAs), with the
+/// name shown to users.
+const BROWSERS: &[(&str, &str)] = &[
+    ("msedge.exe", "Microsoft Edge"),
+    ("chrome.exe", "Google Chrome"),
+    ("brave.exe", "Brave"),
+    ("vivaldi.exe", "Vivaldi"),
+    ("opera.exe", "Opera"),
+    ("chromium.exe", "Chromium"),
+];
+
+/// Display name of a PWA-capable browser executable.
+pub fn browser_name(exe: &str) -> Option<&'static str> {
+    BROWSERS
+        .iter()
+        .find(|(e, _)| e.eq_ignore_ascii_case(exe))
+        .map(|(_, n)| *n)
+}
+
+/// Extracts the web-app id from a Chromium app window's AppUserModelID,
+/// e.g. `MSEdge._crx_cinhimbnkkaeohfgghhklpknlkffjgod` →
+/// `cinhimbnkkaeohfgghhklpknlkffjgod`.
+pub fn web_app_id(app_user_model_id: &str) -> Option<String> {
+    let i = app_user_model_id.find("_crx_")?;
+    let id: String = app_user_model_id[i + 5..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    (id.len() >= 16).then_some(id)
+}
+
+/// Cleans a web app window title such as `Song • Artist - YouTube Music`
+/// down to the app name when the relaunch name is unavailable.
+pub fn web_app_name_from_title(title: &str) -> String {
+    let t = title.trim();
+    t.rsplit_once(" - ")
+        .map(|(_, app)| app.trim())
+        .filter(|a| !a.is_empty())
+        .unwrap_or(t)
+        .to_string()
+}
+
 pub fn is_graphics_module(name: &str) -> bool {
     GRAPHICS_DLLS.iter().any(|d| d.eq_ignore_ascii_case(name))
 }
@@ -357,6 +399,25 @@ mod tests {
         assert_eq!(display_name(&f, &cfg), "Fortnite");
         f.is_foreground = false;
         assert_eq!(classify(&f, &cfg), Verdict::NotAGame);
+    }
+
+    #[test]
+    fn web_apps() {
+        assert_eq!(
+            web_app_id("MSEdge._crx_cinhimbnkkaeohfgghhklpknlkffjgod").as_deref(),
+            Some("cinhimbnkkaeohfgghhklpknlkffjgod")
+        );
+        assert_eq!(
+            web_app_id("Chrome._crx_cinhimbnkkaeohfgghhklpknlkffjgod.UserData.Default").as_deref(),
+            Some("cinhimbnkkaeohfgghhklpknlkffjgod")
+        );
+        assert_eq!(web_app_id("Microsoft.Windows.Explorer"), None);
+        assert_eq!(browser_name("MSEDGE.EXE"), Some("Microsoft Edge"));
+        assert_eq!(
+            web_app_name_from_title("Song • Artist - YouTube Music"),
+            "YouTube Music"
+        );
+        assert_eq!(web_app_name_from_title("YouTube Music"), "YouTube Music");
     }
 
     #[test]

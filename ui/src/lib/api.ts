@@ -46,6 +46,7 @@ export const api = {
   openStorageFolder: () => call<void>("open_storage_folder"),
   rescanLibrary: () => call<ScanReport | null>("rescan_library"),
   listProcesses: () => call<WindowedProcess[]>("list_processes"),
+  listAudioApps: () => call<import("./types").AudioApp[]>("list_audio_apps"),
   prepareAudioTracks: (id: number) => call<TrackFile[]>("prepare_audio_tracks", { id }),
   exportClip: (id: number, request: ExportRequest) => call<MediaItem>("export_clip", { id, request }),
   processIcon: (path: string) => call<string | null>("process_icon", { path }),

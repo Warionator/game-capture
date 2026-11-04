@@ -28,10 +28,28 @@ export interface AudioSource {
   muted: boolean;
 }
 
+export interface WebAppRef {
+  appId: string;
+  browser: string;
+}
+
 export interface AppTrack extends AudioSource {
   name: string;
   executables: string[];
   includeInMix: boolean;
+  /** Installed web app (PWA); `executables` is then the browser. */
+  webApp: WebAppRef | null;
+}
+
+/** A running application offered by the app picker. */
+export interface AudioApp {
+  name: string;
+  exeName: string;
+  exePath: string | null;
+  webApp: WebAppRef | null;
+  playing: boolean;
+  hasWindow: boolean;
+  icon: string | null;
 }
 
 export interface CustomGame {

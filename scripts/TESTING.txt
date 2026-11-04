@@ -65,6 +65,11 @@ SUGGESTED TEST PASS
   [ ] Gallery: tick the circle on a few cards (after the first, clicking a
       card ticks it too), press the red Delete button -> one confirmation,
       all removed. Ctrl+A selects all, Esc clears.
+  [ ] Settings > Audio > Add application track: a list of running apps
+      appears (apps playing sound first). Pick one -> name and executable are
+      filled in. Open your YouTube Music installed web app first: it shows
+      under "Installed web apps" with its own name and icon. Record a clip
+      with it playing -> its track carries the music.
   [ ] Settings > Audio while capturing: level meters move; volume/mute act live.
   [ ] Right-click a clip: Open file location / Copy to clipboard (paste in
       Explorer or Discord) / Details / Delete.

@@ -25,6 +25,24 @@ pub struct WindowedProcess {
     pub display_name: Option<String>,
 }
 
+/// An application that can get its own audio track (app picker).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioApp {
+    pub name: String,
+    /// Executable whose process tree is captured (the browser for web apps).
+    pub exe_name: String,
+    pub exe_path: Option<String>,
+    /// File to take the icon from (`.exe` or `.ico`).
+    #[serde(skip)]
+    pub icon_path: Option<String>,
+    /// Installed web app (PWA) hosted by a browser.
+    pub web_app: Option<gc_core::config::WebAppRef>,
+    /// Currently producing sound (an active audio session).
+    pub playing: bool,
+    pub has_window: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForegroundWindow {
     pub pid: u32,
@@ -83,6 +101,9 @@ mod stub {
     }
     pub fn main_window(_pid: u32) -> Option<isize> {
         None
+    }
+    pub fn audio_apps(_sessions: &std::collections::HashMap<u32, bool>) -> Vec<AudioApp> {
+        Vec::new()
     }
 }
 #[cfg(not(windows))]
@@ -479,6 +500,149 @@ mod imp {
                 ((r.right - r.left) as i64) * ((r.bottom - r.top) as i64)
             })
             .map(|(h, _)| h.0 as isize)
+    }
+
+    /// `(AppUserModelID, relaunch display name, relaunch icon path)` set on
+    /// a window. Chromium sets these on installed web app windows.
+    unsafe fn window_app_props(hwnd: HWND) -> (Option<String>, Option<String>, Option<String>) {
+        use windows::Win32::Storage::EnhancedStorage::{
+            PKEY_AppUserModel_ID, PKEY_AppUserModel_RelaunchDisplayNameResource,
+            PKEY_AppUserModel_RelaunchIconResource,
+        };
+        use windows::Win32::System::Com::CoTaskMemFree;
+        use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
+        use windows::Win32::UI::Shell::PropertiesSystem::{
+            IPropertyStore, SHGetPropertyStoreForWindow,
+        };
+        let Ok(store) = SHGetPropertyStoreForWindow::<IPropertyStore>(hwnd) else {
+            return (None, None, None);
+        };
+        let get = |key| -> Option<String> {
+            let v = store.GetValue(&key).ok()?;
+            let p = PropVariantToStringAlloc(&v).ok()?;
+            let s = PCWSTR(p.0).to_string().ok();
+            CoTaskMemFree(Some(p.0 as *const _));
+            s.filter(|s| !s.trim().is_empty())
+        };
+        (
+            get(PKEY_AppUserModel_ID),
+            get(PKEY_AppUserModel_RelaunchDisplayNameResource).filter(|n| !n.starts_with('@')),
+            get(PKEY_AppUserModel_RelaunchIconResource)
+                .map(|r| r.rsplit_once(',').map(|(p, _)| p.to_string()).unwrap_or(r)),
+        )
+    }
+
+    /// Running applications for the "add an application track" picker:
+    /// windowed apps, installed web apps (recognised by their window's app
+    /// id), and windowless processes that have an audio session.
+    /// `sessions` maps audio-session process ids to "actively playing".
+    pub fn audio_apps(sessions: &HashMap<u32, bool>) -> Vec<AudioApp> {
+        use gc_core::config::{app_label, WebAppRef};
+        use gc_core::detect::{browser_name, web_app_id, web_app_name_from_title};
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        const SKIP: &[&str] = &[
+            "explorer.exe",
+            "applicationframehost.exe",
+            "textinputhost.exe",
+            "shellexperiencehost.exe",
+            "startmenuexperiencehost.exe",
+            "searchhost.exe",
+            "systemsettings.exe",
+            "lockapp.exe",
+            "audiodg.exe",
+            "svchost.exe",
+            "game-capture.exe",
+            "ffmpeg.exe",
+        ];
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let procs = snapshot();
+        let exe_of: HashMap<u32, String> =
+            procs.iter().map(|p| (p.pid, p.exe_name.clone())).collect();
+        let exe_playing = |exe: &str| {
+            sessions.iter().any(|(pid, active)| {
+                *active && exe_of.get(pid).is_some_and(|e| e.eq_ignore_ascii_case(exe))
+            })
+        };
+        let skip = |exe: &str| SKIP.iter().any(|s| s.eq_ignore_ascii_case(exe));
+        let own = std::process::id();
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (hwnd, pid) in top_level_windows() {
+            let Some(exe) = exe_of.get(&pid).cloned() else {
+                continue;
+            };
+            if pid == own || skip(&exe) {
+                continue;
+            }
+            let (aumid, relaunch_name, relaunch_icon) = unsafe { window_app_props(hwnd) };
+            let path = exe_path(pid);
+            if let (Some(id), Some(browser)) =
+                (aumid.as_deref().and_then(web_app_id), browser_name(&exe))
+            {
+                if !seen.insert(format!("web:{id}")) {
+                    continue;
+                }
+                out.push(AudioApp {
+                    name: relaunch_name
+                        .unwrap_or_else(|| web_app_name_from_title(&window_title(hwnd))),
+                    exe_name: exe.clone(),
+                    exe_path: path.clone(),
+                    icon_path: relaunch_icon.or(path),
+                    web_app: Some(WebAppRef {
+                        app_id: id,
+                        browser: browser.to_string(),
+                    }),
+                    playing: exe_playing(&exe),
+                    has_window: true,
+                });
+                continue;
+            }
+            if !seen.insert(exe.to_lowercase()) {
+                continue;
+            }
+            let name = path
+                .as_deref()
+                .and_then(version_display_name)
+                .filter(|n| n.len() > 2 && !n.eq_ignore_ascii_case(&exe))
+                .unwrap_or_else(|| app_label(&exe));
+            out.push(AudioApp {
+                name,
+                playing: exe_playing(&exe),
+                exe_name: exe,
+                icon_path: path.clone(),
+                exe_path: path,
+                web_app: None,
+                has_window: true,
+            });
+        }
+        // Apps playing sound without a window (tray players, background apps).
+        for pid in sessions.keys() {
+            let Some(exe) = exe_of.get(pid).cloned() else {
+                continue;
+            };
+            if *pid == own || skip(&exe) || !seen.insert(exe.to_lowercase()) {
+                continue;
+            }
+            let path = exe_path(*pid);
+            out.push(AudioApp {
+                name: path
+                    .as_deref()
+                    .and_then(version_display_name)
+                    .unwrap_or_else(|| app_label(&exe)),
+                playing: exe_playing(&exe),
+                exe_name: exe,
+                icon_path: path.clone(),
+                exe_path: path,
+                web_app: None,
+                has_window: false,
+            });
+        }
+        out.sort_by(|a, b| {
+            b.playing
+                .cmp(&a.playing)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        out
     }
 
     pub fn windowed_processes() -> Vec<WindowedProcess> {

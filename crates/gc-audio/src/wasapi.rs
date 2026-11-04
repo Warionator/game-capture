@@ -283,6 +283,41 @@ unsafe fn capture_thread(
     Ok(())
 }
 
+/// Process ids with an audio session on the default playback device, mapped
+/// to whether the session is actively playing.
+pub fn audio_sessions() -> anyhow::Result<std::collections::HashMap<u32, bool>> {
+    use windows::Win32::Media::Audio::{
+        AudioSessionStateActive, IAudioSessionControl2, IAudioSessionManager2,
+    };
+    unsafe {
+        let _com = ComGuard::init();
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
+        let manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
+        let sessions = manager.GetSessionEnumerator()?;
+        let mut out = std::collections::HashMap::new();
+        for i in 0..sessions.GetCount()? {
+            let Ok(ctl) = sessions.GetSession(i) else {
+                continue;
+            };
+            let Ok(ctl2) = ctl.cast::<IAudioSessionControl2>() else {
+                continue;
+            };
+            let Ok(pid) = ctl2.GetProcessId() else {
+                continue;
+            };
+            if pid == 0 {
+                continue; // system sounds
+            }
+            let active = ctl.GetState().is_ok_and(|s| s == AudioSessionStateActive);
+            let e = out.entry(pid).or_insert(false);
+            *e |= active;
+        }
+        Ok(out)
+    }
+}
+
 pub fn list_capture_devices() -> anyhow::Result<Vec<AudioDevice>> {
     unsafe {
         let _com = ComGuard::init();

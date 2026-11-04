@@ -1,16 +1,12 @@
-import { Info, Mic, Plus, Trash2, Volume2, VolumeX } from "lucide-react";
+import { AppWindow, Globe, Info, Mic, Plus, Replace, Trash2, Volume2, VolumeX } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { cx } from "../lib/format";
 import { useStore } from "../lib/store";
 import type { AppTrack, AudioDevice, AudioSource, Settings, TrackLevel } from "../lib/types";
+import { AppPicker, appLabel, type PickedApp } from "../components/AppPicker";
 import { Badge, Button, Field, IconButton, Section, Select, TextInput, Tip, Toggle } from "../components/ui";
 
-/** Track name for an executable, matching the backend: `spotify.exe` → `Spotify`. */
-function appLabel(exe: string): string {
-  const stem = exe.trim().replace(/\.exe$/i, "");
-  return stem ? stem[0].toUpperCase() + stem.slice(1) : "App";
-}
 
 const MIX_HINT =
   "On: this app is also mixed into Track 1 (the combined “Master” track you hear by default and when sharing). Off: it is only recorded on its own track, e.g. music you want to keep out of shared clips but still have available when editing.";
@@ -148,28 +144,27 @@ function TrackRow({
   );
 }
 
-function ExeInput({ value, onChange }: { value: string[]; onChange: (v: string[]) => void }) {
-  const [text, setText] = useState(value.join(", "));
-  useEffect(() => setText(value.join(", ")), [value]);
+/** Shows which app a track records, with a button to pick another. */
+function AppChip({ track, onChange }: { track: AppTrack; onChange: () => void }) {
+  const exe = track.executables[0] ?? "";
   return (
-    <label className="flex items-center gap-2">
-      Executables
-      <TextInput
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        onBlur={() =>
-          onChange(
-            text
-              .split(",")
-              .map((s) => s.trim())
-              .filter(Boolean),
-          )
-        }
-        placeholder="Discord.exe"
-        compact
-        className="w-56 font-mono"
-      />
-    </label>
+    <div className="flex w-full flex-col gap-1.5">
+      <div className="flex items-center gap-2">
+        <span className="inline-flex items-center gap-1.5 rounded-md border border-line-strong bg-raised px-2 py-1 text-xs text-fg">
+          {track.webApp ? <Globe size={12} className="text-sky-300" /> : <AppWindow size={12} className="text-faint" />}
+          {track.webApp ? `Web app · ${track.webApp.browser}` : exe || "No app selected"}
+        </span>
+        <Button size="sm" variant="ghost" onClick={onChange}>
+          <Replace size={13} /> Change app…
+        </Button>
+      </div>
+      {track.webApp && (
+        <p className="text-[11px] leading-relaxed text-amber-200/80">
+          {track.webApp.browser} plays all of its tabs and web apps through one audio process, so this track also records
+          any other {track.webApp.browser} tab or web app that makes sound.
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -223,16 +218,50 @@ function MicControl({
 }
 
 export function AudioTab() {
-  const { settings, update, status } = useStore();
+  const { settings, update, status, notify } = useStore();
   const levels = useLevels();
   const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [loopback, setLoopback] = useState<boolean | null>(null);
+  /** App picker target: "voice", an extra track index, or "new". */
+  const [picking, setPicking] = useState<"voice" | "new" | number | null>(null);
   useEffect(() => {
     api.listAudioDevices().then(setDevices).catch(() => {});
     api.systemInfo().then((i) => setLoopback(i.processLoopback)).catch(() => {});
   }, []);
   if (!settings) return null;
   const a = settings.audio;
+
+  const onPicked = (app: PickedApp) => {
+    const target = picking;
+    const fields = { name: app.name, executables: [app.exeName], webApp: app.webApp };
+    // Tracks capture whole processes: two tracks on the same executable
+    // (e.g. two Edge web apps) would record the same sound twice.
+    const sameExe = (t: AppTrack) => t.executables.some((e) => e.toLowerCase() === app.exeName.toLowerCase());
+    const others = [a.voice, ...a.extraTracks].filter((_, i) => (target === "voice" ? i !== 0 : target !== i - 1));
+    const clash = others.find(sameExe);
+    if (clash) {
+      const owner = clash.name || appLabel(clash.executables[0] ?? "");
+      notify(
+        app.webApp
+          ? `${app.webApp.browser} is already recorded by the “${owner}” track – web apps from the same browser share one track.`
+          : `${app.name} already has its own track (“${owner}”).`,
+        true,
+      );
+      return;
+    }
+    update((x) => {
+      if (target === "voice") Object.assign(x.audio.voice, fields);
+      else if (typeof target === "number") Object.assign(x.audio.extraTracks[target], fields);
+      else
+        x.audio.extraTracks.push({
+          ...fields,
+          enabled: true,
+          volume: 1,
+          muted: false,
+          includeInMix: false,
+        } satisfies AppTrack);
+    });
+  };
 
   // Persist + apply live.
   const change = (title: string, pick: (s: Settings) => AudioSource, patch: Partial<AudioSource>) => {
@@ -330,7 +359,7 @@ export function AudioTab() {
           peak={levels.peaks[voiceTitle]}
           onChange={(p) => change(voiceTitle, (x) => x.audio.voice, p)}
         >
-          <ExeInput value={a.voice.executables} onChange={(v) => update((x) => void (x.audio.voice.executables = v))} />
+          <AppChip track={a.voice} onChange={() => setPicking("voice")} />
           <Tip text={MIX_HINT} wide>
             <label className="flex cursor-help items-center gap-2">
               <Toggle
@@ -356,16 +385,17 @@ export function AudioTab() {
               removable
               onRemove={() => update((x) => void x.audio.extraTracks.splice(i, 1))}
             >
-              <label className="flex items-center gap-2">
-                Name
+              <AppChip track={t} onChange={() => setPicking(i)} />
+              <label className="flex items-center gap-2" title="Name used for this track in your clips">
+                Track name
                 <TextInput
+                  key={t.name}
                   defaultValue={t.name}
                   onBlur={(e) => update((x) => void (x.audio.extraTracks[i].name = e.target.value))}
                   compact
-                  className="w-32"
+                  className="w-40"
                 />
               </label>
-              <ExeInput value={t.executables} onChange={(v) => update((x) => void (x.audio.extraTracks[i].executables = v))} />
               <Tip text={MIX_HINT} wide>
                 <label className="flex cursor-help items-center gap-2">
                   <Toggle
@@ -381,25 +411,18 @@ export function AudioTab() {
           );
         })}
         <div className="py-3">
-          <Button
-            size="sm"
-            onClick={() =>
-              update((x) =>
-                x.audio.extraTracks.push({
-                  name: "Spotify",
-                  executables: ["Spotify.exe"],
-                  enabled: true,
-                  volume: 1,
-                  muted: false,
-                  includeInMix: false,
-                } satisfies AppTrack),
-              )
-            }
-          >
+          <Button size="sm" onClick={() => setPicking("new")}>
             <Plus size={14} /> Add application track
           </Button>
         </div>
       </Section>
+      {picking !== null && (
+        <AppPicker
+          title={picking === "new" ? "Record an app on its own track" : "Choose the app for this track"}
+          onPick={onPicked}
+          onClose={() => setPicking(null)}
+        />
+      )}
       <Section title="Compatibility">
         <Field
           label="System audio fallback"

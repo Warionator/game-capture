@@ -117,8 +117,10 @@ let settings: Settings = {
       noiseGate: true,
       noiseGateDb: -45,
     },
-    voice: { name: "Discord", executables: ["Discord.exe"], enabled: true, volume: 0.8, muted: false, includeInMix: true },
-    extraTracks: [{ name: "Spotify", executables: ["Spotify.exe"], enabled: true, volume: 0.5, muted: false, includeInMix: false }],
+    voice: { name: "Discord", executables: ["Discord.exe"], enabled: true, volume: 0.8, muted: false, includeInMix: true, webApp: null },
+    extraTracks: [
+      { name: "Spotify", executables: ["Spotify.exe"], enabled: true, volume: 0.5, muted: false, includeInMix: false, webApp: null },
+    ],
     systemAudioFallback: null,
   },
   hotkeys: { saveReplay: "Alt+F10", toggleRecording: "Alt+F9", addBookmark: "Alt+F8", screenshot: "Alt+F12" },
@@ -253,6 +255,13 @@ const handlers: Record<string, (a: Record<string, unknown>) => unknown> = {
     { pid: 6001, exeName: "Discord.exe", exePath: "C:\\Users\\me\\AppData\\Local\\Discord\\Discord.exe", windowTitle: "#general - Discord", displayName: "Discord" },
   ],
   process_icon: () => null,
+  list_audio_apps: () => [
+    { name: "YouTube Music", exeName: "msedge.exe", exePath: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", webApp: { appId: "cinhimbnkkaeohfgghhklpknlkffjgod", browser: "Microsoft Edge" }, playing: true, hasWindow: true, icon: icon("YouTube Music") },
+    { name: "Spotify", exeName: "Spotify.exe", exePath: "C:\\Users\\me\\AppData\\Roaming\\Spotify\\Spotify.exe", webApp: null, playing: false, hasWindow: true, icon: icon("Spotify") },
+    { name: "Discord", exeName: "Discord.exe", exePath: null, webApp: null, playing: false, hasWindow: true, icon: icon("Discord") },
+    { name: "Google Chrome", exeName: "chrome.exe", exePath: null, webApp: null, playing: false, hasWindow: true, icon: icon("Chrome") },
+    { name: "Microsoft Teams", exeName: "ms-teams.exe", exePath: null, webApp: null, playing: false, hasWindow: false, icon: null },
+  ],
   prepare_audio_tracks: (a) => {
     const m = media.find((x) => x.id === a.id);
     if (!m || m.audioTracks.length < 2) return [];
