@@ -340,12 +340,7 @@ pub fn prefetch_tracks(state: &AppState, item: &gc_library::MediaItem) {
     let (Some(ff), true) = (state.ffmpeg.clone(), n > 1) else {
         return;
     };
-    let master = item.audio_tracks[0].eq_ignore_ascii_case("Master");
-    let indices: Vec<usize> = if master {
-        (1..n).collect()
-    } else {
-        (0..n).collect()
-    };
+    let indices: Vec<usize> = (0..n).collect();
     let key = format!("{}-{}", item.id, item.mtime_ms);
     let (path, titles, cache) = (
         item.path.clone(),

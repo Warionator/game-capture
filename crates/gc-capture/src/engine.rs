@@ -1149,8 +1149,23 @@ impl Worker {
             bookmarks: Vec::new(),
             resolution: Some(format!("{w}x{h}")),
             encoder: Some(encoder_name(p.spec.backend, p.spec.codec).to_string()),
-            audio_tracks: p.audio_titles.clone(),
+            audio_tracks: self.track_titles(&p.audio_titles),
+            mix_tracks: self.track_titles(&p.mix_titles),
         }
+    }
+
+    /// Track names as written into files: the game track is named after the
+    /// game ("Elden Ring"), apps after the app, the rest stay generic.
+    fn track_titles(&self, titles: &[String]) -> Vec<String> {
+        titles
+            .iter()
+            .map(|t| match &self.game {
+                Some(g) if t == "Game" && !g.display_name.trim().is_empty() => {
+                    g.display_name.clone()
+                }
+                _ => t.clone(),
+            })
+            .collect()
     }
 
     fn save_replay(&mut self) {
@@ -1316,7 +1331,8 @@ impl Worker {
             ext,
         );
         let game = meta.game_title.clone();
-        match SessionWriter::create(out, meta, p.audio_titles.clone()) {
+        let titles = meta.audio_tracks.clone();
+        match SessionWriter::create(out, meta, titles) {
             Ok(w) => {
                 *p.shared.session.lock() = Some(w);
                 drop(guard);

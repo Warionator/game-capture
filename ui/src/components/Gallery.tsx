@@ -60,7 +60,14 @@ export function Gallery({ game, onLibraryChanged }: { game: string | null; onLib
   const [dur, setDur] = useState<DurationRange>("any");
   const [sort, setSort] = useState<SortOrder>("newest");
   const [groupBy, setGroupBy] = useState<GroupBy>(game ? "date" : "game");
-  const [selected, setSelected] = useState<number | null>(null);
+  const [checked, setChecked] = useState<Set<number>>(new Set());
+  const toggle = (id: number) =>
+    setChecked((s) => {
+      const n = new Set(s);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
   const [menu, setMenu] = useState<{ x: number; y: number; item: MediaItem } | null>(null);
   const [playing, setPlaying] = useState<{ item: MediaItem; startMs?: number } | null>(null);
   const [details, setDetails] = useState<MediaItem | null>(null);
@@ -121,17 +128,55 @@ export function Gallery({ game, onLibraryChanged }: { game: string | null; onLib
     [notify, confirm, onLibraryChanged],
   );
 
+  // Ticked items that are still listed (filters may hide some).
+  const checkedItems = useMemo(() => items.filter((i) => checked.has(i.id)), [items, checked]);
+
+  const removeChecked = useCallback(async () => {
+    const list = checkedItems;
+    if (list.length === 0) return;
+    if (list.length === 1) {
+      await remove(list[0]);
+      setChecked(new Set());
+      return;
+    }
+    const bytes = list.reduce((n, i) => n + i.sizeBytes, 0);
+    const ok = await confirm({
+      title: `Delete ${list.length} captures?`,
+      message: `${list.length} files (${formatBytes(bytes)}) will be removed from disk permanently.`,
+      confirmLabel: `Delete ${list.length}`,
+      danger: true,
+    });
+    if (!ok) return;
+    const failed: string[] = [];
+    const gone = new Set<number>();
+    for (const it of list) {
+      try {
+        await api.deleteMedia(it.id);
+        gone.add(it.id);
+      } catch (e) {
+        failed.push(`${fileName(it.path)}: ${e}`);
+      }
+    }
+    setItems((xs) => xs.filter((x) => !gone.has(x.id)));
+    setChecked(new Set());
+    onLibraryChanged();
+    if (failed.length) notify(`${failed.length} file(s) could not be deleted: ${failed[0]}`, true);
+    else notify(`Deleted ${list.length} files`);
+  }, [checkedItems, confirm, notify, onLibraryChanged, remove]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (playing || details || (e.target as HTMLElement).closest("input, select, textarea")) return;
-      const item = items.find((i) => i.id === selected);
-      if (!item) return;
-      if (e.key === "Delete") void remove(item);
-      if (e.key === "Enter") setPlaying({ item });
+      if (playing || details || (e.target as HTMLElement).closest("input, select, textarea, [role=dialog], [role=alertdialog]")) return;
+      if (e.key === "Delete" && checkedItems.length) void removeChecked();
+      if (e.key === "Escape") setChecked(new Set());
+      if (e.key.toLowerCase() === "a" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        setChecked(new Set(items.map((i) => i.id)));
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [items, selected, remove, playing, details]);
+  }, [items, checkedItems, removeChecked, playing, details]);
 
   const groups = useMemo(() => {
     if (groupBy === "none") return [{ key: "all", label: "", items }];
@@ -275,7 +320,34 @@ export function Gallery({ game, onLibraryChanged }: { game: string | null; onLib
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4" onMouseDown={() => setSelected(null)}>
+      {checkedItems.length > 0 && (
+        <div className="flex items-center gap-3 border-b border-line bg-sky-500/10 px-5 py-2">
+          <span className="text-sm font-medium">
+            {checkedItems.length} selected
+            <span className="ml-2 text-xs font-normal text-muted">
+              {formatBytes(checkedItems.reduce((n, i) => n + i.sizeBytes, 0))}
+            </span>
+          </span>
+          <Button size="sm" variant="ghost" onClick={() => setChecked(new Set(items.map((i) => i.id)))}>
+            Select all
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => setChecked(new Set())}>
+            Clear
+          </Button>
+          <Button
+            size="sm"
+            variant="danger"
+            className="ml-auto"
+            onClick={() => void removeChecked()}
+            title="Delete the selected files (Del)"
+            aria-label={`Delete ${checkedItems.length} selected`}
+          >
+            <Trash2 size={14} /> Delete
+          </Button>
+        </div>
+      )}
+
+      <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
         {!loading && items.length === 0 ? (
           <Empty icon={<LibraryIcon size={40} />} title={search || kind || date !== "any" || dur !== "any" ? "Nothing matches these filters" : "No captures yet"}>
             {search || kind || date !== "any" || dur !== "any"
@@ -294,12 +366,13 @@ export function Gallery({ game, onLibraryChanged }: { game: string | null; onLib
               )}
               <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3">
                 {g.items.map((it) => (
-                  <div key={it.id} onMouseDown={(e) => e.stopPropagation()}>
+                  <div key={it.id}>
                     <MediaCard
                       item={it}
-                      selected={selected === it.id}
+                      checked={checked.has(it.id)}
+                      selecting={checkedItems.length > 0}
                       showGame={groupBy !== "game" && !game}
-                      onSelect={() => setSelected(it.id)}
+                      onToggle={() => toggle(it.id)}
                       onOpen={() => setPlaying({ item: it })}
                       onContextMenu={(e) => setMenu({ x: e.clientX, y: e.clientY, item: it })}
                     />

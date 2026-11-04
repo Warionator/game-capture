@@ -1,10 +1,19 @@
-import { Mic, Plus, Trash2, Volume2, VolumeX } from "lucide-react";
+import { Info, Mic, Plus, Trash2, Volume2, VolumeX } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { cx } from "../lib/format";
 import { useStore } from "../lib/store";
 import type { AppTrack, AudioDevice, AudioSource, Settings, TrackLevel } from "../lib/types";
-import { Badge, Button, Field, IconButton, Section, Select, TextInput, Toggle } from "../components/ui";
+import { Badge, Button, Field, IconButton, Section, Select, TextInput, Tip, Toggle } from "../components/ui";
+
+/** Track name for an executable, matching the backend: `spotify.exe` → `Spotify`. */
+function appLabel(exe: string): string {
+  const stem = exe.trim().replace(/\.exe$/i, "");
+  return stem ? stem[0].toUpperCase() + stem.slice(1) : "App";
+}
+
+const MIX_HINT =
+  "On: this app is also mixed into Track 1 (the combined “Master” track you hear by default and when sharing). Off: it is only recorded on its own track, e.g. music you want to keep out of shared clips but still have available when editing.";
 
 interface Levels {
   peaks: Record<string, number>;
@@ -237,7 +246,7 @@ export function AudioTab() {
   let n = a.mixdownEnabled ? 2 : 1;
   const idx = () => n++;
   const running = status?.state === "buffering" || status?.state === "recording";
-  const voiceTitle = a.voice.name || a.voice.executables[0] || "Voice";
+  const voiceTitle = a.voice.name.trim() || (a.voice.executables[0] ? appLabel(a.voice.executables[0]) : "Voice");
 
   return (
     <>
@@ -322,17 +331,20 @@ export function AudioTab() {
           onChange={(p) => change(voiceTitle, (x) => x.audio.voice, p)}
         >
           <ExeInput value={a.voice.executables} onChange={(v) => update((x) => void (x.audio.voice.executables = v))} />
-          <label className="flex items-center gap-2">
-            <Toggle
-              label="Include in master mix"
-              checked={a.voice.includeInMix}
-              onChange={(b) => update((x) => void (x.audio.voice.includeInMix = b))}
-            />
-            In master mix
-          </label>
+          <Tip text={MIX_HINT} wide>
+            <label className="flex cursor-help items-center gap-2">
+              <Toggle
+                label="Include in master mix"
+                checked={a.voice.includeInMix}
+                onChange={(b) => update((x) => void (x.audio.voice.includeInMix = b))}
+              />
+              In master mix
+              <Info size={12} className="text-faint" />
+            </label>
+          </Tip>
         </TrackRow>
         {a.extraTracks.map((t, i) => {
-          const title = t.name || t.executables[0] || `App ${i + 1}`;
+          const title = t.name.trim() || (t.executables[0] ? appLabel(t.executables[0]) : `App ${i + 1}`);
           return (
             <TrackRow
               key={i}
@@ -354,14 +366,17 @@ export function AudioTab() {
                 />
               </label>
               <ExeInput value={t.executables} onChange={(v) => update((x) => void (x.audio.extraTracks[i].executables = v))} />
-              <label className="flex items-center gap-2">
-                <Toggle
-                  label="Include in master mix"
-                  checked={t.includeInMix}
-                  onChange={(b) => update((x) => void (x.audio.extraTracks[i].includeInMix = b))}
-                />
-                In master mix
-              </label>
+              <Tip text={MIX_HINT} wide>
+                <label className="flex cursor-help items-center gap-2">
+                  <Toggle
+                    label="Include in master mix"
+                    checked={t.includeInMix}
+                    onChange={(b) => update((x) => void (x.audio.extraTracks[i].includeInMix = b))}
+                  />
+                  In master mix
+                  <Info size={12} className="text-faint" />
+                </label>
+              </Tip>
             </TrackRow>
           );
         })}

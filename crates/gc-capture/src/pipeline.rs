@@ -90,6 +90,8 @@ pub struct Pipeline {
     pub shared: Arc<Shared>,
     pub spec: PipelineSpec,
     pub audio_titles: Vec<String>,
+    /// Titles of the tracks mixed into the Master track.
+    pub mix_titles: Vec<String>,
 }
 
 impl Pipeline {
@@ -133,6 +135,15 @@ impl Pipeline {
         }
         let has_audio = !spec.audio.is_empty();
         let audio_titles = if has_audio { audio_titles } else { Vec::new() };
+        let mix_titles: Vec<String> = if has_audio {
+            inputs
+                .iter()
+                .filter(|t| t.in_mix)
+                .map(|t| t.title.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         spec.mixdown = has_audio && audio.layout.iter().any(|t| t.kind == TrackKind::Mix);
 
         let args = spec.build_args();
@@ -238,6 +249,7 @@ impl Pipeline {
             shared,
             spec,
             audio_titles,
+            mix_titles,
         })
     }
 

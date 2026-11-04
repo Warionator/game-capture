@@ -299,6 +299,24 @@ export function Modal({
   );
 }
 
+/** Hover/focus tooltip with a short explanation. */
+export function Tip({ text, children, wide }: { text: string; children: ReactNode; wide?: boolean }) {
+  return (
+    <span className="group/tip relative inline-flex">
+      {children}
+      <span
+        role="tooltip"
+        className={cx(
+          "pointer-events-none absolute bottom-full left-1/2 z-30 mb-2 -translate-x-1/2 rounded-md border border-line-strong bg-raised px-2.5 py-1.5 text-xs leading-relaxed font-normal text-fg opacity-0 shadow-xl transition-opacity group-focus-within/tip:opacity-100 group-hover/tip:opacity-100",
+          wide ? "w-72" : "w-56",
+        )}
+      >
+        {text}
+      </span>
+    </span>
+  );
+}
+
 export function Empty({ icon, title, children }: { icon: ReactNode; title: string; children?: ReactNode }) {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-3 p-10 text-center">

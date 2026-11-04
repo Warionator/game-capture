@@ -70,12 +70,6 @@ export function Sidebar({
           label="All captures"
           count={total}
         />
-        <NavItem
-          active={view === "settings"}
-          onClick={() => setView("settings")}
-          icon={<SettingsIcon size={16} />}
-          label="Settings"
-        />
       </nav>
       <div className="px-4 pt-3 pb-1.5 text-[11px] font-semibold tracking-wider text-faint uppercase">Games</div>
       <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto px-2 pb-2">
@@ -94,14 +88,22 @@ export function Sidebar({
           />
         ))}
       </div>
-      <button
-        onClick={() => api.openStorageFolder()}
-        className="flex items-center gap-2 border-t border-line px-4 py-3 text-left text-xs text-muted hover:bg-hover hover:text-fg"
-      >
-        <FolderOpen size={14} />
-        <span className="flex-1">Open library folder</span>
-        <span className="text-faint">{formatBytes(bytes)}</span>
-      </button>
+      <div className="border-t border-line p-2">
+        <button
+          onClick={() => api.openStorageFolder()}
+          className="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left text-xs text-muted hover:bg-hover hover:text-fg"
+        >
+          <FolderOpen size={14} />
+          <span className="flex-1">Open library folder</span>
+          <span className="text-faint">{formatBytes(bytes)}</span>
+        </button>
+        <NavItem
+          active={view === "settings"}
+          onClick={() => setView("settings")}
+          icon={<SettingsIcon size={16} />}
+          label="Settings"
+        />
+      </div>
     </aside>
   );
 }

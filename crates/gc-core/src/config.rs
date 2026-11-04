@@ -663,6 +663,21 @@ pub struct TrackSpec {
     pub gate_db: Option<f32>,
 }
 
+/// Friendly track name for an executable: `Spotify.exe` → `Spotify`.
+pub fn app_label(exe: &str) -> String {
+    let stem = exe.trim();
+    let stem = stem
+        .rsplit_once('.')
+        .filter(|(_, ext)| ext.eq_ignore_ascii_case("exe"))
+        .map(|(s, _)| s)
+        .unwrap_or(stem);
+    let mut c = stem.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => "App".into(),
+    }
+}
+
 impl AudioSettings {
     pub fn sources_mut(&mut self) -> Vec<&mut AudioSource> {
         let mut v = vec![&mut self.game, &mut self.mic.source, &mut self.voice.source];
@@ -703,9 +718,9 @@ impl AudioSettings {
             if app.source.enabled && !app.executables.is_empty() {
                 out.push(TrackSpec {
                     title: if app.name.trim().is_empty() {
-                        app.executables[0].clone()
+                        app_label(&app.executables[0])
                     } else {
-                        app.name.clone()
+                        app.name.trim().to_string()
                     },
                     kind: TrackKind::Apps {
                         executables: app.executables.clone(),
@@ -901,6 +916,10 @@ mod tests {
         });
         let layout = a.track_layout();
         assert_eq!(layout.len(), 5);
+        a.extra_tracks[0].name = String::new();
+        a.extra_tracks[0].executables = vec!["chrome.exe".into()];
+        assert_eq!(a.track_layout()[4].title, "Chrome");
+        assert_eq!(app_label("obs64.EXE"), "Obs64");
         assert!(!layout[4].in_mix);
     }
 

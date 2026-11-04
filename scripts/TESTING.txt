@@ -58,6 +58,13 @@ SUGGESTED TEST PASS
       a new clip appears in the same game folder.
   [ ] Player: "Audio tracks" opens instantly; fullscreen button (or F) works.
   [ ] Delete / overwrite prompts are game-capture dialogs, not Windows boxes.
+  [ ] Edit a clip: crop, Audio tracks -> mute everything but the mic, lower
+      it, Save as a copy. Open the copy: it plays the (mic-only) combined
+      mix by default; Audio tracks shows each track by name (the game's
+      name, Microphone, Discord, Spotify...).
+  [ ] Gallery: tick the circle on a few cards (after the first, clicking a
+      card ticks it too), press the red Delete button -> one confirmation,
+      all removed. Ctrl+A selects all, Esc clears.
   [ ] Settings > Audio while capturing: level meters move; volume/mute act live.
   [ ] Right-click a clip: Open file location / Copy to clipboard (paste in
       Explorer or Discord) / Details / Delete.

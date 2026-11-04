@@ -385,6 +385,7 @@ mod tests {
                     resolution: None,
                     encoder: None,
                     audio_tracks: vec![],
+                    mix_tracks: vec![],
                 };
                 tags.extend(m.to_tags());
             }

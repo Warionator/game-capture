@@ -148,9 +148,9 @@ pub async fn rescan_library(app: AppHandle, state: St<'_>) -> CmdResult<Option<S
         .map_err(err)
 }
 
-/// Extracts the individual audio tracks of a clip for per-track playback.
-/// For game-capture clips (Master + isolated tracks) only the isolated
-/// tracks are returned; the video element itself plays the Master track.
+/// Extracts every audio track of a multi-track clip for playback. The player
+/// plays these itself (the combined Master track by default) rather than
+/// relying on which track the web view would pick from the video file.
 #[tauri::command]
 pub async fn prepare_audio_tracks(
     state: St<'_>,
@@ -161,12 +161,7 @@ pub async fn prepare_audio_tracks(
         let (item, path) = media_path(&state, id)?;
         let ff = state.ffmpeg.clone().ok_or("FFmpeg is missing")?;
         let n = item.audio_tracks.len();
-        let master = n > 1 && item.audio_tracks[0].eq_ignore_ascii_case("Master");
-        let indices: Vec<usize> = match (n, master) {
-            (0 | 1, _) => vec![],
-            (_, true) => (1..n).collect(),
-            (_, false) => (0..n).collect(),
-        };
+        let indices: Vec<usize> = if n > 1 { (0..n).collect() } else { vec![] };
         let key = format!("{}-{}", item.id, item.mtime_ms);
         gc_capture::edit::extract_tracks(
             &ff,
@@ -207,6 +202,7 @@ pub async fn export_clip(
             resolution: item.width.zip(item.height).map(|(w, h)| format!("{w}x{h}")),
             encoder: None,
             audio_tracks: item.audio_tracks.clone(),
+            mix_tracks: Vec::new(),
         };
         let out = gc_capture::edit::export_clip(&ff, &path, &request, fallback, &state.temp_dir)
             .map_err(|e| format!("{e:#}"))?;

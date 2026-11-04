@@ -1,4 +1,4 @@
-import { Bookmark, Clapperboard, Film, Image as ImageIcon } from "lucide-react";
+import { Bookmark, Check, Clapperboard, Film, Image as ImageIcon } from "lucide-react";
 import { useState } from "react";
 import { fileUrl } from "../lib/api";
 import { cx, formatDuration } from "../lib/format";
@@ -12,16 +12,20 @@ export function KindIcon({ kind, size = 12 }: { kind: MediaItem["kind"]; size?: 
 
 export function MediaCard({
   item,
-  selected,
+  checked,
+  selecting,
   onOpen,
-  onSelect,
+  onToggle,
   onContextMenu,
   showGame,
 }: {
   item: MediaItem;
-  selected: boolean;
+  /** Ticked for a bulk action. */
+  checked: boolean;
+  /** At least one card is ticked: clicking a card toggles it. */
+  selecting: boolean;
   onOpen: () => void;
-  onSelect: () => void;
+  onToggle: () => void;
   onContextMenu: (e: React.MouseEvent) => void;
   showGame: boolean;
 }) {
@@ -30,21 +34,47 @@ export function MediaCard({
   const time = new Date(item.createdMs).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
   const date = new Date(item.createdMs).toLocaleDateString(undefined, { month: "short", day: "numeric" });
   return (
-    <button
-      onClick={() => {
-        onSelect();
-        onOpen();
+    <div
+      role="button"
+      tabIndex={0}
+      aria-pressed={selecting ? checked : undefined}
+      onClick={() => (selecting ? onToggle() : onOpen())}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") selecting ? onToggle() : onOpen();
+        if (e.key === " ") {
+          e.preventDefault();
+          onToggle();
+        }
       }}
       onContextMenu={(e) => {
         e.preventDefault();
-        onSelect();
         onContextMenu(e);
       }}
       className={cx(
-        "group flex flex-col overflow-hidden rounded-lg border bg-panel text-left transition-colors",
-        selected ? "border-accent ring-1 ring-accent" : "border-line hover:border-line-strong",
+        "group relative flex cursor-pointer flex-col overflow-hidden rounded-lg border bg-panel text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-accent",
+        checked ? "border-accent ring-1 ring-accent" : "border-line hover:border-line-strong",
       )}
     >
+      <button
+        type="button"
+        role="checkbox"
+        aria-checked={checked}
+        aria-label={checked ? "Deselect" : "Select"}
+        title={checked ? "Deselect" : "Select"}
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggle();
+        }}
+        className={cx(
+          "absolute top-1.5 right-1.5 z-10 flex size-6 items-center justify-center rounded-full border-2 transition-opacity",
+          checked
+            ? "border-accent bg-accent text-slate-950 opacity-100"
+            : "border-white/80 bg-black/45 text-transparent hover:bg-black/70",
+          checked || selecting ? "opacity-100" : "opacity-0 group-hover:opacity-100 focus-visible:opacity-100",
+        )}
+      >
+        <Check size={14} strokeWidth={3} />
+      </button>
       <div className="relative aspect-video w-full overflow-hidden bg-raised">
         {thumb && !broken ? (
           <img
@@ -80,6 +110,6 @@ export function MediaCard({
         <span className="truncate text-[13px] text-fg">{showGame ? (item.gameTitle ?? "Uncategorized") : time}</span>
         <span className="shrink-0 text-[11px] text-faint">{showGame ? `${date}, ${time}` : date}</span>
       </div>
-    </button>
+    </div>
   );
 }

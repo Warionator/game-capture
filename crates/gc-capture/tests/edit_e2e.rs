@@ -59,6 +59,7 @@ fn trim_mute_overwrite_and_copy() {
         resolution: Some("320x180".into()),
         encoder: Some("libx264".into()),
         audio_tracks: vec![],
+        mix_tracks: vec![],
     };
     // 8 s clip: Master = game+mic, Game (440 Hz), Microphone (880 Hz).
     let mut cmd = Command::new(&ff.ffmpeg);

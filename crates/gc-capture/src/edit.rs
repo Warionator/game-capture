@@ -149,6 +149,9 @@ pub fn export_clip(
         audio_streams: n_audio,
         gains: req.gains.clone().filter(|_| n_audio > 0),
         rebuild_master: n_audio > 1 && info.audio_tracks[0].eq_ignore_ascii_case("Master"),
+        mix_members: (1..n_audio)
+            .filter(|&i| meta.mix_tracks.iter().any(|t| t == &info.audio_tracks[i]))
+            .collect(),
         tags: meta.to_tags(),
         audio_titles: info.audio_tracks.clone(),
         chapters_file,

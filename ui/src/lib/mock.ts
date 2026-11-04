@@ -256,7 +256,7 @@ const handlers: Record<string, (a: Record<string, unknown>) => unknown> = {
   prepare_audio_tracks: (a) => {
     const m = media.find((x) => x.id === a.id);
     if (!m || m.audioTracks.length < 2) return [];
-    return m.audioTracks.slice(1).map((title, i) => ({ index: i + 1, title, path: "" }));
+    return m.audioTracks.map((title, index) => ({ index, title, path: "" }));
   },
   overlay_ready: () => undefined,
   preview_overlay: () => notice("(mock) An in-game popup would appear now"),

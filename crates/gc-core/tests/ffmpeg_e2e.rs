@@ -128,6 +128,7 @@ fn encode_chunk_ring_remux_probe() {
         resolution: Some("640x360".into()),
         encoder: Some("libx264".into()),
         audio_tracks: vec!["Master".into(), "Game".into(), "Microphone".into()],
+        mix_tracks: vec![],
     };
     let chapters = dir.path().join("chapters.txt");
     std::fs::write(&chapters, meta.ffmetadata_chapters()).unwrap();

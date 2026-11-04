@@ -29,19 +29,20 @@ const MIN_CLIP_MS = 1000;
 
 type TrackState = Record<number, { volume: number; muted: boolean }>;
 
-/** Plays the isolated tracks of a clip in sync with the (muted) video. */
+/** Plays a clip's extracted audio tracks in sync with the (muted) video.
+ *  Every track plays all the time; `levelOf` decides which are audible, so
+ *  switching between the combined mix and individual tracks is instant. */
 function useTrackPlayback(
   video: React.RefObject<HTMLVideoElement | null>,
   tracks: TrackFile[] | null,
-  active: boolean,
-  state: TrackState,
-  master: number,
+  levelOf: (t: TrackFile) => { volume: number; muted: boolean },
+  levelKey: string,
 ) {
   const els = useRef<HTMLAudioElement[]>([]);
 
   useEffect(() => {
     const v = video.current;
-    if (!active || !tracks || !v) return;
+    if (!tracks || tracks.length === 0 || !v) return;
     const audios = tracks.map((t) => {
       const a = new Audio(fileUrl(t.path));
       a.preload = "auto";
@@ -80,16 +81,17 @@ function useTrackPlayback(
       });
       els.current = [];
     };
-  }, [video, tracks, active]);
+  }, [video, tracks]);
 
   useEffect(() => {
     if (!tracks) return;
     els.current.forEach((a, i) => {
-      const s = state[tracks[i].index] ?? { volume: 1, muted: false };
-      a.volume = Math.max(0, Math.min(1, s.volume * master));
-      a.muted = s.muted;
+      const l = levelOf(tracks[i]);
+      a.volume = Math.max(0, Math.min(1, l.volume));
+      a.muted = l.muted;
     });
-  }, [state, master, tracks, active]);
+    // levelKey captures everything levelOf depends on.
+  }, [tracks, levelKey]);
 
   return els;
 }
@@ -266,16 +268,36 @@ export function Player({
   const src = released ? undefined : fileUrl(item.path, item.mtimeMs);
   const durMs = duration * 1000;
   const multiTrack = item.audioTracks.length > 1;
+  // game-capture layout: track 1 is the combined mix of the others.
+  const masterLayout = multiTrack && item.audioTracks[0].toLowerCase() === "master";
+  const tracksReady = !!tracks && tracks.length > 0;
+  /** Tracks the user can adjust individually. */
+  const isolated = useMemo(
+    () => (tracks ?? []).filter((t) => !masterLayout || t.index > 0),
+    [tracks, masterLayout],
+  );
 
-  useTrackPlayback(video, tracks, trackMode, trackState, volume);
+  // Which extracted track is audible: the combined mix by default, the
+  // individual tracks in track mode.
+  const levelOf = (t: TrackFile) => {
+    const isMaster = masterLayout && t.index === 0;
+    if (muted) return { volume: 0, muted: true };
+    if (!trackMode) return { volume: volume, muted: masterLayout ? !isMaster : false };
+    if (isMaster) return { volume: 0, muted: true };
+    const st = trackState[t.index] ?? { volume: 1, muted: false };
+    return { volume: st.volume * volume, muted: st.muted };
+  };
+  const levelKey = JSON.stringify([muted, volume, trackMode, trackState, masterLayout]);
+  useTrackPlayback(video, tracks, levelOf, levelKey);
 
-  // Master (video element) audio: muted while individual tracks play.
+  // The video element only plays its own audio until the extracted tracks
+  // are ready (or for single-track files).
   useEffect(() => {
     const v = video.current;
     if (!v) return;
     v.volume = volume;
-    v.muted = trackMode || muted;
-  }, [volume, muted, trackMode]);
+    v.muted = tracksReady || muted;
+  }, [volume, muted, tracksReady]);
 
   const cropping = durMs > 0 && (trim[0] > 0 || trim[1] < durMs - 1);
 
@@ -386,7 +408,7 @@ export function Player({
         setLoadingTracks(false);
       }
     }
-    if (t.length === 0) {
+    if (t.length < 2) {
       notify("This clip has no separate audio tracks", true);
       return;
     }
@@ -394,10 +416,14 @@ export function Player({
   };
 
   const gains: TrackGain[] | null = useMemo(() => {
-    if (!trackMode || !tracks) return null;
-    const g = tracks.map((t) => ({ index: t.index, volume: trackState[t.index]?.volume ?? 1, muted: trackState[t.index]?.muted ?? false }));
+    if (!trackMode || isolated.length === 0) return null;
+    const g = isolated.map((t) => ({
+      index: t.index,
+      volume: trackState[t.index]?.volume ?? 1,
+      muted: trackState[t.index]?.muted ?? false,
+    }));
     return g.some((x) => x.muted || Math.abs(x.volume - 1) > 0.005) ? g : null;
-  }, [trackMode, tracks, trackState]);
+  }, [trackMode, isolated, trackState]);
 
   const trimmed = cropping;
   const edited = !isImage && (trimmed || gains !== null);
@@ -606,9 +632,6 @@ export function Player({
                   <Scissors size={12} /> {formatDuration(trim[1] - trim[0])} selected
                 </span>
               )}
-              <IconButton label={fullscreen ? "Exit fullscreen (F)" : "Fullscreen (F)"} onClick={() => void toggleFullscreen()}>
-                {fullscreen ? <Minimize size={16} /> : <Maximize size={16} />}
-              </IconButton>
               {multiTrack && (
                 <Button
                   size="sm"
@@ -660,14 +683,17 @@ export function Player({
                   </div>
                 )}
               </div>
+              <IconButton label={fullscreen ? "Exit fullscreen (F)" : "Fullscreen (F)"} onClick={() => void toggleFullscreen()}>
+                {fullscreen ? <Minimize size={16} /> : <Maximize size={16} />}
+              </IconButton>
             </div>
           </div>
-          {trackMode && tracks && tracks.length > 0 && (
+          {trackMode && isolated.length > 0 && (
             <div className="grid gap-x-6 gap-y-2 rounded-md border border-line bg-raised/50 px-3 py-2.5 sm:grid-cols-2">
               <div className="col-span-full text-xs text-faint">
                 Playing the individual tracks (the combined mix is muted). These levels are kept when you save.
               </div>
-              {tracks.map((t) => {
+              {isolated.map((t) => {
                 const st = trackState[t.index] ?? { volume: 1, muted: false };
                 const set = (p: Partial<typeof st>) => setTrackState((s) => ({ ...s, [t.index]: { ...st, ...p } }));
                 return (

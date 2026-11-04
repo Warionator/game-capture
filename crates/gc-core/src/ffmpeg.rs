@@ -824,6 +824,9 @@ pub struct ExportSpec {
     /// The first audio stream is a mix of the others (game-capture layout);
     /// it is rebuilt from the adjusted tracks.
     pub rebuild_master: bool,
+    /// Audio stream indices that make up the master mix (empty = all of
+    /// the other tracks).
+    pub mix_members: Vec<usize>,
     pub tags: Vec<(String, String)>,
     pub audio_titles: Vec<String>,
     pub chapters_file: Option<String>,
@@ -869,9 +872,10 @@ pub fn export_args(input: &Path, output: &Path, spec: &ExportSpec) -> Vec<String
             let mut graph = Vec::new();
             let mut maps = Vec::new();
             let mut mix_in = Vec::new();
+            let in_mix = |i: usize| spec.mix_members.is_empty() || spec.mix_members.contains(&i);
             for &i in &isolated {
                 let g = gain_of(i);
-                if first == 1 {
+                if first == 1 && in_mix(i) {
                     graph.push(format!("[0:a:{i}]volume={g:.3},asplit=2[t{i}][m{i}]"));
                     mix_in.push(format!("[m{i}]"));
                 } else {
@@ -1326,6 +1330,11 @@ mod tests {
         assert!(fc.contains("[0:a:1]volume=1.000,asplit=2[t1][m1]"));
         assert!(fc.contains("[0:a:2]volume=0.000,asplit=2[t2][m2]"));
         assert!(fc.contains("[m1][m2][m3]amix=inputs=3"));
+        spec.mix_members = vec![1, 2];
+        let a = export_args(Path::new("in.mp4"), Path::new("out.mkv"), &spec);
+        let fc = arg_after(&a, "-filter_complex").unwrap();
+        assert!(fc.contains("[0:a:3]volume=1.000[t3]"), "{fc}");
+        assert!(fc.contains("[m1][m2]amix=inputs=2"), "{fc}");
         let maps: Vec<_> = a
             .windows(2)
             .filter(|w| w[0] == "-map")

@@ -72,6 +72,10 @@ pub struct ClipMetadata {
     pub encoder: Option<String>,
     #[serde(default)]
     pub audio_tracks: Vec<String>,
+    /// Titles of the tracks the first ("Master") track is a mix of. Used to
+    /// rebuild that mix when track volumes are edited.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mix_tracks: Vec<String>,
 }
 
 fn schema_version() -> u32 {
@@ -149,6 +153,7 @@ impl ClipMetadata {
             resolution: get("resolution").map(str::to_string),
             encoder: None,
             audio_tracks: Vec::new(),
+            mix_tracks: Vec::new(),
         })
     }
 
@@ -219,6 +224,7 @@ mod tests {
             resolution: Some("2560x1440".into()),
             encoder: Some("hevc_nvenc".into()),
             audio_tracks: vec!["Master".into(), "Game".into()],
+            mix_tracks: vec!["Game".into()],
         }
     }
 
