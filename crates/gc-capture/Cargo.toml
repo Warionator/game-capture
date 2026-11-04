@@ -1,0 +1,31 @@
+[package]
+name = "gc-capture"
+description = "Capture engine for game-capture: FFmpeg pipeline (DXGI Desktop Duplication → hardware encoder), replay ring buffer, session recording, clip export with embedded metadata, and framebuffer screenshots."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gc-core.workspace = true
+gc-platform.workspace = true
+gc-audio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+image.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true

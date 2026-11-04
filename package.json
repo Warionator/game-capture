@@ -1,0 +1,17 @@
+{
+  "name": "game-capture",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Lightweight game clipping and recording for Windows",
+  "scripts": {
+    "postinstall": "npm --prefix ui install",
+    "dev": "tauri dev",
+    "ui": "npm --prefix ui run dev",
+    "build": "tauri build --config src-tauri/tauri.bundle.conf.json",
+    "fetch-ffmpeg": "pwsh -NoProfile -File scripts/fetch-ffmpeg.ps1",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0"
+  }
+}

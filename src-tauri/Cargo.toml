@@ -1,0 +1,32 @@
+[package]
+name = "game-capture"
+description = "Lightweight game clipping and recording for Windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+default-run = "game-capture"
+
+[lib]
+name = "game_capture_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+gc-core.workspace = true
+gc-library.workspace = true
+gc-platform.workspace = true
+gc-audio.workspace = true
+gc-capture.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+base64.workspace = true
+tauri = { version = "2", features = ["tray-icon", "protocol-asset", "image-png"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"

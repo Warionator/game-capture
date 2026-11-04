@@ -1,0 +1,18 @@
+[package]
+name = "gc-core"
+description = "Platform-independent core of game-capture: settings, naming, hotkey parsing, FFmpeg pipeline construction, MPEG-TS replay ring buffer, metadata model and game detection heuristics."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

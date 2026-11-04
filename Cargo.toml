@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gc-core",
+    "crates/gc-library",
+    "crates/gc-platform",
+    "crates/gc-audio",
+    "crates/gc-capture",
+    "src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Warionator"]
+repository = "https://github.com/Warionator/game-capture"
+
+[workspace.dependencies]
+gc-core = { path = "crates/gc-core" }
+gc-library = { path = "crates/gc-library" }
+gc-platform = { path = "crates/gc-platform" }
+gc-audio = { path = "crates/gc-audio" }
+gc-capture = { path = "crates/gc-capture" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+log = { version = "0.4", features = ["std"] }
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.22"
+walkdir = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
+windows = { version = "0.62" }
+windows-core = { version = "0.62" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
