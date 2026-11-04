@@ -349,7 +349,7 @@ const handlers: Record<string, (a: Record<string, unknown>) => unknown> = {
     emit("status", status);
   },
   system_info: () => ({
-    version: "0.1.0",
+    version: "1.0.0",
     windowsBuild: 22631,
     processLoopback: true,
     gameModeEnabled: false,

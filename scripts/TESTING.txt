@@ -1,4 +1,4 @@
-game-capture 0.1.0 - portable test build (Windows 10/11 x64)
+game-capture 1.0.0 - portable build (Windows 10/11 x64)
 
 RUN
   1. Extract the whole folder somewhere permanent (e.g. C:\Tools\game-capture).
