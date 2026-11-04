@@ -29,6 +29,48 @@ pub struct Settings {
     pub screenshot: ScreenshotSettings,
     pub system: SystemSettings,
     pub games: GameSettings,
+    pub recording: RecordingSettings,
+    pub overlay: OverlaySettings,
+}
+
+/// Full-session recording.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RecordingSettings {
+    /// Start recording when a game launches and stop when it exits.
+    pub auto_record_sessions: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum OverlayPosition {
+    #[default]
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+/// In-game popups ("Capture ready", "Saved last 2:00"…) and their chimes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct OverlaySettings {
+    pub enabled: bool,
+    pub position: OverlayPosition,
+    pub sound: bool,
+    /// Chime volume 0.0 – 1.0.
+    pub volume: f32,
+}
+
+impl Default for OverlaySettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            position: OverlayPosition::TopLeft,
+            sound: true,
+            volume: 0.6,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -43,6 +85,8 @@ impl Default for Settings {
             screenshot: ScreenshotSettings::default(),
             system: SystemSettings::default(),
             games: GameSettings::default(),
+            recording: RecordingSettings::default(),
+            overlay: OverlaySettings::default(),
         }
     }
 }
@@ -111,11 +155,17 @@ impl Settings {
             .duration_secs
             .clamp(REPLAY_MIN_SECS, REPLAY_MAX_SECS);
         self.replay.max_memory_mb = self.replay.max_memory_mb.clamp(64, 16_384);
-        self.video.sanitize();
+        self.video.quality.sanitize();
+        self.replay.quality.sanitize();
         for src in self.audio.sources_mut() {
             src.volume = src.volume.clamp(0.0, 2.0);
         }
         self.screenshot.jpeg_quality = self.screenshot.jpeg_quality.clamp(10, 100);
+        self.overlay.volume = if self.overlay.volume.is_finite() {
+            self.overlay.volume.clamp(0.0, 1.0)
+        } else {
+            0.6
+        };
         let mic = &mut self.audio.mic;
         mic.noise_suppression_strength = mic.noise_suppression_strength.clamp(1, 40);
         mic.noise_gate_db = if mic.noise_gate_db.is_finite() {
@@ -137,7 +187,21 @@ impl Settings {
                 .map(|t| (t.title, t.kind))
                 .collect::<Vec<_>>()
         };
-        self.video != other.video
+        let capture = |v: &VideoSettings| {
+            (
+                v.capture_mode,
+                v.focus_screen,
+                v.encoder,
+                v.codec,
+                v.monitor_index,
+                v.capture_cursor,
+                v.zero_copy,
+            )
+        };
+        // Recording quality and the container only matter when a recording
+        // starts or a file is written, so they never restart the buffer.
+        capture(&self.video) != capture(&other.video)
+            || self.replay.quality != other.replay.quality
             || self.replay.enabled != other.replay.enabled
             || self.replay.storage != other.replay.storage
             || self.audio.mic.device_id != other.audio.mic.device_id
@@ -294,11 +358,15 @@ pub struct VideoSettings {
     /// Replace the picture with a "Game not in focus" screen while another
     /// window is in front of the game.
     pub focus_screen: bool,
-    pub resolution: Resolution,
-    pub fps: FrameRate,
+    /// Allow capturing the desktop (replay buffer, recordings, screenshots)
+    /// when no game is running. Off by default: nothing is captured outside
+    /// games.
+    pub allow_desktop_capture: bool,
+    /// Quality of session recordings (clips use [`ReplaySettings::quality`]).
+    #[serde(flatten)]
+    pub quality: Quality,
     pub encoder: EncoderPreference,
     pub codec: Codec,
-    pub rate_control: RateControl,
     pub container: Container,
     /// DXGI output index to capture when no game window is known.
     pub monitor_index: u32,
@@ -314,11 +382,10 @@ impl Default for VideoSettings {
         Self {
             capture_mode: CaptureMode::Window,
             focus_screen: true,
-            resolution: Resolution::Native,
-            fps: FrameRate::default(),
+            allow_desktop_capture: false,
+            quality: Quality::default(),
             encoder: EncoderPreference::Auto,
             codec: Codec::H264,
-            rate_control: RateControl::default(),
             container: Container::Mp4,
             monitor_index: 0,
             capture_cursor: false,
@@ -327,7 +394,27 @@ impl Default for VideoSettings {
     }
 }
 
-impl VideoSettings {
+/// Resolution, frame rate and rate control of one output (clips or
+/// recordings each have their own).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Quality {
+    pub resolution: Resolution,
+    pub fps: FrameRate,
+    pub rate_control: RateControl,
+}
+
+impl Default for Quality {
+    fn default() -> Self {
+        Self {
+            resolution: Resolution::Native,
+            fps: FrameRate::default(),
+            rate_control: RateControl::default(),
+        }
+    }
+}
+
+impl Quality {
     fn sanitize(&mut self) {
         if !FrameRate::SUPPORTED.contains(&self.fps.0) {
             self.fps = FrameRate::default();
@@ -390,6 +477,8 @@ pub struct ReplaySettings {
     pub disk_dir: Option<PathBuf>,
     /// Start the buffer automatically when a game is detected.
     pub auto_start: bool,
+    /// Quality of saved clips (recordings use [`VideoSettings::quality`]).
+    pub quality: Quality,
 }
 
 impl Default for ReplaySettings {
@@ -401,6 +490,7 @@ impl Default for ReplaySettings {
             max_memory_mb: 1024,
             disk_dir: None,
             auto_start: true,
+            quality: Quality::default(),
         }
     }
 }
@@ -778,22 +868,22 @@ mod tests {
     fn sanitize_clamps_ranges() {
         let mut s = Settings::default();
         s.replay.duration_secs = 5;
-        s.video.rate_control = RateControl::Vbr {
+        s.video.quality.rate_control = RateControl::Vbr {
             bitrate_kbps: 500_000,
             max_kbps: 10,
         };
-        s.video.fps = FrameRate(75);
+        s.video.quality.fps = FrameRate(75);
         s.audio.game.volume = 9.0;
         s.sanitize();
         assert_eq!(s.replay.duration_secs, REPLAY_MIN_SECS);
         assert_eq!(
-            s.video.rate_control,
+            s.video.quality.rate_control,
             RateControl::Vbr {
                 bitrate_kbps: BITRATE_MAX_KBPS,
                 max_kbps: BITRATE_MAX_KBPS
             }
         );
-        assert_eq!(s.video.fps, FrameRate(60));
+        assert_eq!(s.video.quality.fps, FrameRate(60));
         assert_eq!(s.audio.game.volume, 2.0);
     }
 
@@ -828,7 +918,7 @@ mod tests {
         let p = dir.path().join("settings.json");
         let mut s = Settings::default();
         s.video.codec = Codec::Hevc;
-        s.video.rate_control = RateControl::Quality { level: 23 };
+        s.video.quality.rate_control = RateControl::Quality { level: 23 };
         s.save(&p).unwrap();
         assert_eq!(Settings::load_or_default(&p), s);
 
@@ -845,7 +935,7 @@ mod tests {
         let s = Settings::load_or_default(&p);
         assert_eq!(s.replay.duration_secs, 300);
         assert_eq!(
-            s.video.rate_control,
+            s.video.quality.rate_control,
             RateControl::Cbr { bitrate_kbps: 8000 }
         );
         assert!(s.replay.enabled);
@@ -894,6 +984,15 @@ mod tests {
         b.audio.mic.noise_gate = true;
         b.audio.mic.noise_gate_db = -30.0;
         assert!(!a.pipeline_differs(&b), "gate and volume are applied live");
+        b.video.quality.fps = FrameRate(144);
+        b.video.container = Container::Mkv;
+        assert!(
+            !a.pipeline_differs(&b),
+            "recording quality applies to the next recording"
+        );
+        b.replay.quality.fps = FrameRate(30);
+        assert!(a.pipeline_differs(&b), "clip quality restarts the buffer");
+        b.replay.quality = a.replay.quality;
         b.video.codec = Codec::Av1;
         assert!(a.pipeline_differs(&b));
     }

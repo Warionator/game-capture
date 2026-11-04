@@ -244,7 +244,7 @@ export function AudioTab() {
       <Section
         title="Audio tracks"
         description="Each source is recorded to its own track. Game and app audio are isolated per process, so notification sounds stay out."
-        actions={running ? <Badge tone="ok">Live levels</Badge> : <Badge>Levels appear while capturing</Badge>}
+        actions={<Badge tone="ok">{running ? "Live levels" : "Live levels (preview)"}</Badge>}
       >
         <Field
           label="Track 1 · Master mix"

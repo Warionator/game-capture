@@ -78,7 +78,7 @@ export function ReplayTab() {
   const r = settings.replay;
   // Nearest slider stop for arbitrary typed values.
   const idx = STOPS.reduce((best, s, i) => (Math.abs(s - r.durationSecs) < Math.abs(STOPS[best] - r.durationSecs) ? i : best), 0);
-  const estimate = (((peakKbps(settings.video.rateControl) + 1000) * 1000) / 8) * r.durationSecs * 1.1;
+  const estimate = (((peakKbps(r.quality.rateControl) + 1000) * 1000) / 8) * r.durationSecs * 1.1;
   const fitsRam = estimate <= r.maxMemoryMb * 1024 * 1024;
   const where = r.storage === "memory" ? "in RAM" : r.storage === "disk" ? "on disk" : fitsRam ? "in RAM" : "on disk";
   const setSecs = (secs: number) => update((x) => void (x.replay.durationSecs = secs));
@@ -137,8 +137,8 @@ export function ReplayTab() {
           />
         </Field>
       </Section>
-      <Section title="Quality" description="Applies to replays and recordings (same settings as the Video tab).">
-        <QualityFields />
+      <Section title="Clip quality" description="Used for saved replays. Session recordings have their own quality in the Recording tab.">
+        <QualityFields target="replay" />
       </Section>
     </>
   );

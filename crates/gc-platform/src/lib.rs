@@ -6,8 +6,10 @@
 
 pub mod display;
 pub mod hotkeys;
+pub mod overlay;
 pub mod process;
 pub mod shell;
+pub mod sound;
 pub mod system;
 pub mod watcher;
 

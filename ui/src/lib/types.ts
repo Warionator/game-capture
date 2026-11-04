@@ -9,6 +9,13 @@ export type ImageFormat = "png" | "jpeg";
 export type MediaKind = "clip" | "session" | "screenshot";
 export type Backend = "nvenc" | "amf" | "qsv" | "software";
 export type CaptureMode = "window" | "monitor";
+export type OverlayPosition = "topLeft" | "topRight" | "bottomLeft" | "bottomRight";
+
+export interface Quality {
+  resolution: Resolution;
+  fps: number;
+  rateControl: RateControl;
+}
 
 export type RateControl =
   | { mode: "cbr"; bitrateKbps: number }
@@ -40,6 +47,8 @@ export interface Settings {
   video: {
     captureMode: CaptureMode;
     focusScreen: boolean;
+    allowDesktopCapture: boolean;
+    /** Recording quality (flattened). */
     resolution: Resolution;
     fps: number;
     encoder: EncoderPreference;
@@ -57,6 +66,8 @@ export interface Settings {
     maxMemoryMb: number;
     diskDir: string | null;
     autoStart: boolean;
+    /** Clip quality. */
+    quality: Quality;
   };
   audio: {
     mixdownEnabled: boolean;
@@ -87,6 +98,8 @@ export interface Settings {
     showNotifications: boolean;
   };
   games: { autoDetect: boolean; custom: CustomGame[]; excluded: string[] };
+  recording: { autoRecordSessions: boolean };
+  overlay: { enabled: boolean; position: OverlayPosition; sound: boolean; volume: number };
 }
 
 export interface Bookmark {
@@ -162,6 +175,7 @@ export interface EngineStatus {
   encodersProbed: boolean;
   captureSource: string | null;
   focusLost: boolean;
+  desktopCapture: boolean;
 }
 
 export interface EncoderInfo {
@@ -218,6 +232,16 @@ export interface ExportRequest {
   endMs: number;
   gains: TrackGain[] | null;
   overwrite: boolean;
+  /** Save the selection as a new clip next to the source. */
+  asClip?: boolean;
+}
+
+export type ToastKind = "ready" | "saved" | "recordStart" | "recordStop" | "bookmark" | "screenshot" | "error";
+
+export interface OverlayToast {
+  kind: ToastKind;
+  title: string;
+  detail: string | null;
 }
 
 export interface WindowedProcess {

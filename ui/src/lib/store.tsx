@@ -6,6 +6,17 @@ interface Toast extends Notice {
   id: number;
 }
 
+export interface ConfirmOptions {
+  title: string;
+  message: string;
+  confirmLabel?: string;
+  danger?: boolean;
+}
+
+interface PendingConfirm extends ConfirmOptions {
+  resolve: (ok: boolean) => void;
+}
+
 interface Store {
   settings: Settings | null;
   /** Applies a change locally and persists it (debounced). */
@@ -14,6 +25,9 @@ interface Store {
   toasts: Toast[];
   notify: (message: string, error?: boolean) => void;
   dismiss: (id: number) => void;
+  /** In-app confirmation dialog (replaces the OS message box). */
+  confirm: (o: ConfirmOptions) => Promise<boolean>;
+  pendingConfirm: PendingConfirm | null;
 }
 
 const Ctx = createContext<Store | null>(null);
@@ -22,6 +36,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [status, setStatus] = useState<EngineStatus | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
+  const confirm = useCallback(
+    (o: ConfirmOptions) =>
+      new Promise<boolean>((resolve) =>
+        setPendingConfirm({
+          ...o,
+          resolve: (ok) => {
+            setPendingConfirm(null);
+            resolve(ok);
+          },
+        }),
+      ),
+    [],
+  );
   const saveTimer = useRef<number | undefined>(undefined);
   const pending = useRef<Settings | null>(null);
   const nextId = useRef(1);
@@ -77,7 +105,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [flush],
   );
 
-  return <Ctx.Provider value={{ settings, update, status, toasts, notify, dismiss }}>{children}</Ctx.Provider>;
+  return (
+    <Ctx.Provider value={{ settings, update, status, toasts, notify, dismiss, confirm, pendingConfirm }}>
+      {children}
+    </Ctx.Provider>
+  );
 }
 
 export function useStore(): Store {

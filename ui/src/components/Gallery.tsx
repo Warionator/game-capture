@@ -10,7 +10,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, confirmDialog, on } from "../lib/api";
+import { api, on } from "../lib/api";
 import { cx, fileName, formatBytes, formatDay } from "../lib/format";
 import { useStore } from "../lib/store";
 import type { MediaFilter, MediaItem, MediaKind, SortOrder } from "../lib/types";
@@ -51,7 +51,7 @@ function buildFilter(
 }
 
 export function Gallery({ game, onLibraryChanged }: { game: string | null; onLibraryChanged: () => void }) {
-  const { notify } = useStore();
+  const { notify, confirm } = useStore();
   const [items, setItems] = useState<MediaItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [kind, setKind] = useState<MediaKind | null>(null);
@@ -102,7 +102,12 @@ export function Gallery({ game, onLibraryChanged }: { game: string | null; onLib
 
   const remove = useCallback(
     async (item: MediaItem) => {
-      const ok = await confirmDialog(`Delete "${fileName(item.path)}"? The file is removed from disk permanently.`);
+      const ok = await confirm({
+        title: "Delete this capture?",
+        message: `"${fileName(item.path)}" will be removed from disk permanently.`,
+        confirmLabel: "Delete",
+        danger: true,
+      });
       if (!ok) return;
       try {
         await api.deleteMedia(item.id);
@@ -113,7 +118,7 @@ export function Gallery({ game, onLibraryChanged }: { game: string | null; onLib
         notify(String(e), true);
       }
     },
-    [notify, onLibraryChanged],
+    [notify, confirm, onLibraryChanged],
   );
 
   useEffect(() => {

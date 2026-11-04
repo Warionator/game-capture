@@ -26,6 +26,7 @@ pub struct AudioPlan {
     pub system_fallback: bool,
 }
 
+#[derive(Clone)]
 pub struct RingPlan {
     pub window: Duration,
     pub store: Store,

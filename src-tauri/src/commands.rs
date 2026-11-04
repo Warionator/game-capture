@@ -232,6 +232,7 @@ pub async fn export_clip(
             &out,
         )
         .map_err(err)?;
+        crate::state::prefetch_tracks(&state, &saved);
         let _ = app.emit("library-changed", ScanReport::default());
         Ok(saved)
     })
@@ -349,6 +350,16 @@ pub fn action(state: St, name: String) -> CmdResult<()> {
             Ok(())
         })
         .unwrap_or_else(|| Err("engine stopped".into()))
+}
+
+#[tauri::command]
+pub fn overlay_ready(app: AppHandle) {
+    crate::overlay::on_ready(&app);
+}
+
+#[tauri::command]
+pub fn preview_overlay(app: AppHandle) {
+    crate::overlay::preview(&app);
 }
 
 #[derive(Serialize)]

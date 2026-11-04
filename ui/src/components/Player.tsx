@@ -1,11 +1,16 @@
 import {
+  ArrowLeftToLine,
+  ArrowRightToLine,
   AudioLines,
   Bookmark,
   ExternalLink,
   FolderOpen,
   Loader2,
+  Maximize,
+  Minimize,
   Pause,
   Play,
+  Plus,
   RotateCcw,
   Save,
   Scissors,
@@ -14,7 +19,7 @@ import {
   VolumeX,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, confirmDialog, fileUrl } from "../lib/api";
+import { api, fileUrl, setWindowFullscreen } from "../lib/api";
 import { cx, fileName, formatDate, formatDuration } from "../lib/format";
 import { useStore } from "../lib/store";
 import type { MediaItem, TrackFile, TrackGain } from "../lib/types";
@@ -96,15 +101,24 @@ function Timeline({
   setTrim,
   bookmarks,
   seek,
+  preview,
   editable,
+  onClip,
+  clipBusy,
 }: {
   duration: number;
   time: number;
   trim: [number, number];
   setTrim: (t: [number, number]) => void;
   bookmarks: MediaItem["bookmarks"];
+  /** Seek (kept inside the crop while cropping). */
   seek: (secs: number) => void;
+  /** Unclamped seek used while dragging a crop handle. */
+  preview: (secs: number) => void;
   editable: boolean;
+  /** Sessions: cut the selection into a new clip. */
+  onClip?: () => void;
+  clipBusy?: boolean;
 }) {
   const bar = useRef<HTMLDivElement>(null);
   const drag = useRef<"start" | "end" | "seek" | null>(null);
@@ -120,11 +134,11 @@ function Timeline({
     if (drag.current === "start") {
       const s = Math.min(ms, trim[1] - MIN_CLIP_MS);
       setTrim([s, trim[1]]);
-      seek(s / 1000);
+      preview(s / 1000);
     } else if (drag.current === "end") {
       const e = Math.max(ms, trim[0] + MIN_CLIP_MS);
       setTrim([trim[0], e]);
-      seek(e / 1000);
+      preview(e / 1000);
     }
     else if (drag.current === "seek") seek(ms / 1000);
   };
@@ -144,15 +158,36 @@ function Timeline({
 
   return (
     <div ref={bar} className="relative h-9 cursor-pointer touch-none select-none" onPointerDown={start("seek")} {...handlers}>
+      {onClip && trimmed && (
+        <div
+          className="absolute bottom-full z-20 mb-2 flex -translate-x-1/2 flex-col items-center"
+          style={{ left: `${(pct(trim[0]) + pct(trim[1])) / 2}%` }}
+        >
+          <button
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={onClip}
+            disabled={clipBusy}
+            title="Create a new clip from the selection"
+            className="flex items-center gap-1 rounded-lg border border-white/80 bg-panel px-2.5 py-1 text-xs font-semibold text-white shadow-lg hover:bg-hover disabled:opacity-60"
+          >
+            {clipBusy ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />} Clip
+          </button>
+          <span className="h-2 w-px bg-white/80" />
+        </div>
+      )}
       <div className="absolute top-1/2 right-0 left-0 h-2 -translate-y-1/2 rounded bg-line" />
       {/* Kept selection */}
       <div
         className={cx("absolute top-1/2 h-2 -translate-y-1/2 rounded", trimmed ? "bg-sky-500/35" : "bg-line-strong")}
         style={{ left: `${pct(trim[0])}%`, width: `${pct(trim[1]) - pct(trim[0])}%` }}
       />
+      {/* Played part (inside the crop while cropping). */}
       <div
-        className="absolute top-1/2 left-0 h-2 -translate-y-1/2 rounded-l bg-accent"
-        style={{ width: `${pct(time * 1000)}%` }}
+        className="absolute top-1/2 h-2 -translate-y-1/2 rounded-l bg-accent"
+        style={{
+          left: `${trimmed ? pct(trim[0]) : 0}%`,
+          width: `${Math.max(0, pct(time * 1000) - (trimmed ? pct(trim[0]) : 0))}%`,
+        }}
       />
       {bookmarks.map((b, i) => (
         <button
@@ -205,9 +240,13 @@ export function Player({
   onClose: () => void;
   onDeleted: (id: number) => void;
 }) {
-  const { notify } = useStore();
+  const { notify, confirm } = useStore();
   const [item, setItem] = useState(initial);
   const video = useRef<HTMLVideoElement>(null);
+  const stage = useRef<HTMLDivElement>(null);
+  const [fullscreen, setFullscreen] = useState(false);
+  const [clipping, setClipping] = useState(false);
+  const tracksPromise = useRef<Promise<TrackFile[]> | null>(null);
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState(initial.durationMs / 1000);
   const [playing, setPlaying] = useState(false);
@@ -238,22 +277,76 @@ export function Player({
     v.muted = trackMode || muted;
   }, [volume, muted, trackMode]);
 
-  const seek = useCallback((secs: number) => {
+  const cropping = durMs > 0 && (trim[0] > 0 || trim[1] < durMs - 1);
+
+  const preview = useCallback((secs: number) => {
     const v = video.current;
     if (!v) return;
     v.currentTime = Math.max(0, Math.min(secs, v.duration || secs));
     setTime(v.currentTime);
   }, []);
 
+  /** Seeks; while cropping the playhead stays inside the crop. */
+  const seek = useCallback(
+    (secs: number) => preview(cropping ? Math.max(trim[0] / 1000, Math.min(secs, trim[1] / 1000)) : secs),
+    [preview, cropping, trim],
+  );
+
   const togglePlay = useCallback(() => {
     const v = video.current;
     if (!v) return;
     if (v.paused) {
-      // Play inside the trimmed range.
+      // Play inside the crop, from its start once the end is reached.
       if (v.currentTime * 1000 < trim[0] || v.currentTime * 1000 >= trim[1] - 50) v.currentTime = trim[0] / 1000;
       void v.play();
     } else v.pause();
   }, [trim]);
+
+  const setCropAt = (edge: "start" | "end") => {
+    const v = video.current;
+    if (!v) return;
+    v.pause();
+    const ms = v.currentTime * 1000;
+    if (edge === "start") setTrim(([, e]) => [Math.min(ms, e - MIN_CLIP_MS), e]);
+    else setTrim(([st]) => [st, Math.max(ms, st + MIN_CLIP_MS)]);
+  };
+
+  // Prefetch the separate tracks so "Audio tracks" opens instantly.
+  const loadTracks = useCallback(() => {
+    if (!tracksPromise.current) {
+      tracksPromise.current = api.prepareAudioTracks(item.id);
+      tracksPromise.current.then(setTracks).catch(() => (tracksPromise.current = null));
+    }
+    return tracksPromise.current;
+  }, [item.id]);
+  useEffect(() => {
+    tracksPromise.current = null;
+    if (item.audioTracks.length > 1) void loadTracks().catch(() => {});
+  }, [item.id, item.mtimeMs, item.audioTracks.length, loadTracks]);
+
+  // Fullscreen: the player fills the screen (OS window + element).
+  useEffect(() => {
+    const onChange = () => {
+      const fs = document.fullscreenElement === stage.current && !!stage.current;
+      setFullscreen(fs);
+      if (!document.fullscreenElement) void setWindowFullscreen(false);
+    };
+    document.addEventListener("fullscreenchange", onChange);
+    return () => {
+      document.removeEventListener("fullscreenchange", onChange);
+      if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
+      void setWindowFullscreen(false);
+    };
+  }, []);
+  const toggleFullscreen = async () => {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen().catch(() => {});
+      await setWindowFullscreen(false);
+    } else if (stage.current) {
+      await setWindowFullscreen(true);
+      await stage.current.requestFullscreen().catch(() => {});
+    }
+  };
 
   useEffect(() => {
     if (isImage) return;
@@ -265,6 +358,9 @@ export function Player({
         togglePlay();
       } else if (e.key === "ArrowRight") seek(v.currentTime + 5);
       else if (e.key === "ArrowLeft") seek(v.currentTime - 5);
+      else if (e.key.toLowerCase() === "f") void toggleFullscreen();
+      else if (e.key === "[") setCropAt("start");
+      else if (e.key === "]") setCropAt("end");
       else if (e.key.toLowerCase() === "b") {
         const next = [...item.bookmarks]
           .sort((a, b) => a.offsetMs - b.offsetMs)
@@ -278,21 +374,21 @@ export function Player({
 
   const openTracks = async () => {
     if (trackMode) return;
-    if (!tracks) {
+    let t = tracks;
+    if (!t) {
       setLoadingTracks(true);
       try {
-        const t = await api.prepareAudioTracks(item.id);
-        setTracks(t);
-        if (t.length === 0) {
-          notify("This clip has no separate audio tracks", true);
-          return;
-        }
+        t = await loadTracks();
       } catch (e) {
         notify(`Couldn't load the audio tracks: ${e}`, true);
         return;
       } finally {
         setLoadingTracks(false);
       }
+    }
+    if (t.length === 0) {
+      notify("This clip has no separate audio tracks", true);
+      return;
     }
     setTrackMode(true);
   };
@@ -303,7 +399,7 @@ export function Player({
     return g.some((x) => x.muted || Math.abs(x.volume - 1) > 0.005) ? g : null;
   }, [trackMode, tracks, trackState]);
 
-  const trimmed = durMs > 0 && (trim[0] > 0 || trim[1] < durMs - 1);
+  const trimmed = cropping;
   const edited = !isImage && (trimmed || gains !== null);
 
   /** Stop using the file so Windows lets us replace or delete it. */
@@ -320,7 +416,16 @@ export function Player({
 
   const save = async (overwrite: boolean) => {
     setSaveMenu(false);
-    if (overwrite && !(await confirmDialog("Replace the original clip with the edited version? This can't be undone."))) return;
+    if (
+      overwrite &&
+      !(await confirm({
+        title: "Overwrite the original?",
+        message: "The original file is replaced by the edited version. This can't be undone.",
+        confirmLabel: "Overwrite",
+        danger: true,
+      }))
+    )
+      return;
     setSaving(true);
     if (overwrite) release();
     try {
@@ -349,8 +454,33 @@ export function Player({
     }
   };
 
+  /** Sessions: cut the selection out into a new clip in the same folder. */
+  const makeClip = async () => {
+    setClipping(true);
+    try {
+      const clip = await api.exportClip(item.id, {
+        startMs: Math.round(trim[0]),
+        endMs: Math.round(Math.min(trim[1], durMs || trim[1])),
+        gains,
+        overwrite: false,
+        asClip: true,
+      });
+      notify(`Clip created: ${fileName(clip.path)}`);
+    } catch (e) {
+      notify(String(e), true);
+    } finally {
+      setClipping(false);
+    }
+  };
+
   const remove = async () => {
-    if (!(await confirmDialog(`Delete "${fileName(item.path)}"? The file is removed from disk permanently.`))) return;
+    const ok = await confirm({
+      title: "Delete this capture?",
+      message: `"${fileName(item.path)}" will be removed from disk permanently.`,
+      confirmLabel: "Delete",
+      danger: true,
+    });
+    if (!ok) return;
     release();
     try {
       await api.deleteMedia(item.id);
@@ -366,7 +496,8 @@ export function Player({
 
   return (
     <Modal title={title} onClose={onClose} wide>
-      <div className="relative bg-black">
+      <div ref={stage} className={cx(fullscreen && "flex h-full flex-col bg-black")}>
+      <div className={cx("relative bg-black", fullscreen && "flex min-h-0 flex-1 items-center")}>
         {isImage ? (
           <img src={src} alt={fileName(item.path)} className="mx-auto max-h-[68vh] w-auto object-contain" />
         ) : failed ? (
@@ -386,7 +517,10 @@ export function Player({
             ref={video}
             src={src}
             autoPlay
-            className={cx("mx-auto aspect-video w-full", trackMode ? "max-h-[46vh]" : "max-h-[56vh]")}
+            className={cx(
+              "mx-auto aspect-video w-full",
+              fullscreen ? "h-full max-h-none" : trackMode ? "max-h-[46vh]" : "max-h-[56vh]",
+            )}
             onClick={togglePlay}
             onLoadedMetadata={(e) => {
               const v = e.currentTarget;
@@ -399,7 +533,11 @@ export function Player({
             onTimeUpdate={(e) => {
               const v = e.currentTarget;
               setTime(v.currentTime);
-              if (!v.paused && trimmed && v.currentTime * 1000 >= trim[1]) v.pause();
+              // Crop preview ends at the end handle and rewinds to the start.
+              if (!v.paused && trimmed && v.currentTime * 1000 >= trim[1]) {
+                v.pause();
+                v.currentTime = trim[0] / 1000;
+              }
             }}
             onPlay={() => setPlaying(true)}
             onPause={() => setPlaying(false)}
@@ -414,7 +552,7 @@ export function Player({
       </div>
 
       {!isImage && !failed && (
-        <div className="space-y-2 border-t border-line px-4 pt-2 pb-2">
+        <div className={cx("space-y-2 border-t border-line px-4 pb-2", item.kind === "session" && trimmed ? "pt-10" : "pt-2", fullscreen && "bg-panel")}>
           <Timeline
             duration={duration}
             time={time}
@@ -422,7 +560,10 @@ export function Player({
             setTrim={setTrim}
             bookmarks={item.bookmarks}
             seek={seek}
+            preview={preview}
             editable
+            onClip={item.kind === "session" ? () => void makeClip() : undefined}
+            clipBusy={clipping}
           />
           <div className="flex flex-wrap items-center gap-2">
             <IconButton label={playing ? "Pause (Space)" : "Play (Space)"} onClick={togglePlay}>
@@ -446,9 +587,17 @@ export function Player({
             <span className="font-mono text-xs text-muted tabular-nums">
               {formatDuration(time * 1000)} / {formatDuration(durMs)}
             </span>
+            <div className="ml-2 flex items-center gap-1">
+              <Button size="sm" variant="ghost" onClick={() => setCropAt("start")} title="Start the crop here ( [ )">
+                <ArrowRightToLine size={14} /> Start crop
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setCropAt("end")} title="End the crop here ( ] )">
+                <ArrowLeftToLine size={14} /> End crop
+              </Button>
+            </div>
             {item.bookmarks.length > 0 && (
-              <span className="hidden items-center gap-1 text-xs text-faint md:flex">
-                <Bookmark size={12} className="text-amber-400" /> B jumps to the next bookmark
+              <span className="hidden items-center gap-1 text-xs text-faint xl:flex" title="Press B to jump to the next bookmark">
+                <Bookmark size={12} className="text-amber-400" /> {item.bookmarks.length}
               </span>
             )}
             <div className="ml-auto flex items-center gap-2">
@@ -457,6 +606,9 @@ export function Player({
                   <Scissors size={12} /> {formatDuration(trim[1] - trim[0])} selected
                 </span>
               )}
+              <IconButton label={fullscreen ? "Exit fullscreen (F)" : "Fullscreen (F)"} onClick={() => void toggleFullscreen()}>
+                {fullscreen ? <Minimize size={16} /> : <Maximize size={16} />}
+              </IconButton>
               {multiTrack && (
                 <Button
                   size="sm"
@@ -541,11 +693,13 @@ export function Player({
           )}
           {trimmed && (
             <p className="text-[11px] text-faint">
-              Trimming is lossless, so the cut starts on the nearest keyframe (up to a second before the handle).
+              Cropping: playback stays between the handles. Cuts are lossless, so they start on the nearest keyframe (up to
+              a second before the start).
             </p>
           )}
         </div>
       )}
+      </div>
       <div className="flex items-center gap-2 border-t border-line px-4 py-2.5">
         <span className="min-w-0 flex-1 truncate font-mono text-xs text-faint" title={item.path}>
           {item.path}

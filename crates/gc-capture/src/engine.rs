@@ -4,8 +4,8 @@ use crate::screenshot::{self, ShotTarget};
 use crate::session::SessionWriter;
 use chrono::{DateTime, Duration as ChronoDuration, Local};
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
-use gc_audio::TrackLevel;
-use gc_core::config::{BufferStorage, Settings};
+use gc_audio::{AudioEngine, EngineTrack, TrackLevel};
+use gc_core::config::{BufferStorage, Quality, Settings, TrackKind};
 use gc_core::ffmpeg::{
     encoder_name, Backend, FfmpegCaps, FocusScreen, Output, PipelineSpec, RemuxSpec, VideoSource,
 };
@@ -43,7 +43,7 @@ pub enum CaptureState {
     Starting,
     /// Replay buffer running.
     Buffering,
-    /// Session recording (implies buffering).
+    /// Session recording (with or without the replay buffer).
     Recording,
     Paused,
     Error,
@@ -70,6 +70,8 @@ pub struct EngineStatus {
     pub capture_source: Option<String>,
     /// The "Game not in focus" screen is being recorded right now.
     pub focus_lost: bool,
+    /// Capturing without a game is allowed by the settings.
+    pub desktop_capture: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,11 +82,56 @@ pub struct SavedMedia {
     pub game: Option<String>,
 }
 
+/// Kinds of in-game popups (each has its own chime).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToastKind {
+    /// Capture is ready for a game that just started.
+    Ready,
+    Saved,
+    RecordStart,
+    RecordStop,
+    Bookmark,
+    Screenshot,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Toast {
+    pub kind: ToastKind,
+    pub title: String,
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
     Status(EngineStatus),
     Saved(SavedMedia),
-    Notice { error: bool, message: String },
+    Notice {
+        error: bool,
+        message: String,
+    },
+    /// An in-game popup.
+    Toast(Toast),
+}
+
+fn toast(kind: ToastKind, title: impl Into<String>, detail: Option<String>) -> EngineEvent {
+    EngineEvent::Toast(Toast {
+        kind,
+        title: title.into(),
+        detail,
+    })
+}
+
+/// `125` → `2:05`.
+pub fn clock(secs: f64) -> String {
+    let s = secs.round().max(0.0) as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
 }
 
 enum Cmd {
@@ -102,12 +149,54 @@ enum Cmd {
 }
 
 type Probe = Arc<RwLock<Option<(FfmpegCaps, Vec<EncoderInfo>)>>>;
+type Slot = Arc<Mutex<Option<Pipeline>>>;
+
+/// Meter-only audio engine for the settings page while nothing is captured.
+struct Monitor {
+    engine: AudioEngine,
+    last_poll: Instant,
+    key: MonitorKey,
+}
+
+#[derive(Clone, PartialEq)]
+struct MonitorKey {
+    tracks: Vec<(String, TrackKind)>,
+    mic: Option<String>,
+    game_pid: Option<u32>,
+}
+
+#[derive(Clone)]
+struct MonitorCfg {
+    settings: Settings,
+    game_pid: Option<u32>,
+}
+
+impl MonitorCfg {
+    fn key(&self) -> MonitorKey {
+        MonitorKey {
+            tracks: self
+                .settings
+                .audio
+                .input_tracks()
+                .into_iter()
+                .map(|t| (t.title, t.kind))
+                .collect(),
+            mic: self.settings.audio.mic.device_id.clone(),
+            game_pid: self.game_pid,
+        }
+    }
+}
+
+const MONITOR_IDLE: Duration = Duration::from_secs(3);
 
 pub struct CaptureEngine {
     tx: Sender<Cmd>,
     status: Arc<RwLock<EngineStatus>>,
-    pipeline: Arc<Mutex<Option<Pipeline>>>,
+    replay: Slot,
+    recorder: Slot,
     probe: Probe,
+    monitor: Arc<Mutex<Option<Monitor>>>,
+    monitor_cfg: Arc<RwLock<MonitorCfg>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -124,16 +213,23 @@ impl CaptureEngine {
             encoder_label: None,
             zero_copy: false,
             output_size: None,
-            fps: settings.video.fps.0,
+            fps: settings.replay.quality.fps.0,
             last_error: None,
             ffmpeg_found: paths.ffmpeg.is_some(),
             pending_restart: false,
             encoders_probed: false,
             capture_source: None,
             focus_lost: false,
+            desktop_capture: settings.video.allow_desktop_capture,
         }));
-        let pipeline: Arc<Mutex<Option<Pipeline>>> = Arc::default();
+        let replay: Slot = Arc::default();
+        let recorder: Slot = Arc::default();
         let probe: Probe = Arc::default();
+        let monitor: Arc<Mutex<Option<Monitor>>> = Arc::default();
+        let monitor_cfg = Arc::new(RwLock::new(MonitorCfg {
+            settings: settings.clone(),
+            game_pid: None,
+        }));
         let worker = Worker {
             ff: paths.ffmpeg,
             temp_dir: paths.temp_dir,
@@ -143,8 +239,10 @@ impl CaptureEngine {
             manual: false,
             paused: false,
             status: status.clone(),
-            pipeline: pipeline.clone(),
+            replay: replay.clone(),
+            recorder: recorder.clone(),
             probe: probe.clone(),
+            monitor: monitor.clone(),
             events,
             last_error: None,
             restart_backoff: Duration::from_secs(2),
@@ -153,6 +251,8 @@ impl CaptureEngine {
             shutting_down: false,
             degraded: false,
             capture_label: None,
+            replay_quality: None,
+            announced: None,
         };
         let thread = std::thread::Builder::new()
             .name("gc-capture-engine".into())
@@ -161,8 +261,11 @@ impl CaptureEngine {
         Self {
             tx,
             status,
-            pipeline,
+            replay,
+            recorder,
             probe,
+            monitor,
+            monitor_cfg,
             thread: Some(thread),
         }
     }
@@ -172,9 +275,29 @@ impl CaptureEngine {
     }
 
     pub fn update_settings(&self, s: Settings) {
+        {
+            let mut cfg = self.monitor_cfg.write();
+            cfg.settings = s.clone();
+            let key = cfg.key();
+            let mut m = self.monitor.lock();
+            match m.as_ref() {
+                Some(mon) if mon.key == key => {
+                    for t in s.audio.input_tracks() {
+                        mon.engine.set_track_by_title(&t.title, t.volume, t.muted);
+                        mon.engine.set_gate_by_title(&t.title, t.gate_db);
+                    }
+                }
+                Some(_) => *m = None,
+                None => {}
+            }
+        }
         self.send(Cmd::Settings(Box::new(s)));
     }
     pub fn set_game(&self, g: Option<GameContext>) {
+        self.monitor_cfg.write().game_pid = g.as_ref().map(|g| g.pid);
+        if let Some(m) = self.monitor.lock().as_ref() {
+            m.engine.set_game_pid(g.as_ref().map(|g| g.pid));
+        }
         self.send(Cmd::Game(g));
     }
     /// Starts the buffer without a detected game (desktop capture).
@@ -215,18 +338,82 @@ impl CaptureEngine {
             .unwrap_or_default()
     }
 
+    /// Live levels. While capturing they come from the capture itself;
+    /// otherwise a meter-only audio engine is started on demand (and stopped
+    /// a few seconds after the last call), so levels can be checked in the
+    /// settings without capturing anything.
     pub fn audio_levels(&self) -> Vec<TrackLevel> {
-        self.pipeline
-            .lock()
-            .as_ref()
-            .map(|p| p.audio_levels())
-            .unwrap_or_default()
+        for slot in [&self.replay, &self.recorder] {
+            if let Some(p) = slot.lock().as_ref() {
+                let l = p.audio_levels();
+                if !l.is_empty() {
+                    return l;
+                }
+            }
+        }
+        let cfg = self.monitor_cfg.read().clone();
+        let key = cfg.key();
+        let mut m = self.monitor.lock();
+        if m.as_ref().is_some_and(|mon| mon.key != key) {
+            *m = None;
+        }
+        if m.is_none() {
+            let tracks: Vec<EngineTrack> = cfg
+                .settings
+                .audio
+                .input_tracks()
+                .into_iter()
+                .map(|t| EngineTrack {
+                    title: t.title,
+                    kind: t.kind,
+                    volume: t.volume,
+                    muted: t.muted,
+                    gate_db: t.gate_db,
+                })
+                .collect();
+            if tracks.is_empty() {
+                return Vec::new();
+            }
+            let fallback = cfg
+                .settings
+                .audio
+                .system_audio_fallback
+                .unwrap_or(!gc_platform::system::supports_process_loopback());
+            match AudioEngine::start(
+                tracks,
+                cfg.game_pid,
+                cfg.settings.audio.mic.device_id.clone(),
+                fallback,
+                gc_audio::default_factory(),
+                None,
+            ) {
+                Ok(engine) => {
+                    *m = Some(Monitor {
+                        engine,
+                        last_poll: Instant::now(),
+                        key,
+                    })
+                }
+                Err(e) => {
+                    log::debug!("audio monitor: {e}");
+                    return Vec::new();
+                }
+            }
+        }
+        let mon = m.as_mut().expect("just created");
+        mon.last_poll = Instant::now();
+        mon.engine.levels()
     }
 
     /// Live volume change; also persisted by the caller in settings.
     pub fn set_volume(&self, track_title: &str, volume: f32, muted: bool) {
-        if let Some(p) = self.pipeline.lock().as_ref() {
-            p.set_volume(track_title, volume, muted);
+        for slot in [&self.replay, &self.recorder] {
+            if let Some(p) = slot.lock().as_ref() {
+                p.set_volume(track_title, volume, muted);
+            }
+        }
+        if let Some(m) = self.monitor.lock().as_ref() {
+            m.engine.set_track_by_title(track_title, volume, muted);
         }
     }
 }
@@ -237,6 +424,7 @@ impl Drop for CaptureEngine {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        self.monitor.lock().take();
     }
 }
 
@@ -250,8 +438,13 @@ struct Worker {
     manual: bool,
     paused: bool,
     status: Arc<RwLock<EngineStatus>>,
-    pipeline: Arc<Mutex<Option<Pipeline>>>,
+    /// Replay buffer pipeline (clip quality).
+    replay: Slot,
+    /// Separate pipeline for a recording whose quality differs from the
+    /// clip quality (or when the replay buffer is off).
+    recorder: Slot,
     probe: Probe,
+    monitor: Arc<Mutex<Option<Monitor>>>,
     events: Sender<EngineEvent>,
     last_error: Option<String>,
     restart_backoff: Duration,
@@ -264,6 +457,10 @@ struct Worker {
     /// plain monitor capture until the game changes.
     degraded: bool,
     capture_label: Option<&'static str>,
+    /// Quality the running replay pipeline was started with.
+    replay_quality: Option<Quality>,
+    /// Game (pid) the "capture ready" popup was shown for.
+    announced: Option<u32>,
 }
 
 struct Target {
@@ -273,6 +470,13 @@ struct Target {
     label: &'static str,
     /// The focus screen makes sense (a game is being captured).
     focus_ok: bool,
+}
+
+/// Where the active recording lives.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Host {
+    Replay,
+    Recorder,
 }
 
 impl Worker {
@@ -291,6 +495,10 @@ impl Worker {
         self.stop_pipeline(true);
     }
 
+    fn emit(&self, ev: EngineEvent) {
+        let _ = self.events.send(ev);
+    }
+
     fn notice(&self, error: bool, message: impl Into<String>) {
         let message = message.into();
         if error {
@@ -298,7 +506,7 @@ impl Worker {
         } else {
             log::info!("{message}");
         }
-        let _ = self.events.send(EngineEvent::Notice { error, message });
+        self.emit(EngineEvent::Notice { error, message });
     }
 
     fn spawn_probe(&self) {
@@ -326,19 +534,47 @@ impl Worker {
             .ok();
     }
 
+    fn desktop_allowed(&self) -> bool {
+        self.settings.video.allow_desktop_capture
+    }
+
+    /// Whether the replay buffer pipeline should be running.
     fn wants_pipeline(&self) -> bool {
         !self.paused
-            && (self.manual
-                || (self.game.is_some()
-                    && self.settings.replay.enabled
-                    && self.settings.replay.auto_start))
+            && self.settings.replay.enabled
+            && ((self.manual && self.desktop_allowed())
+                || (self.game.is_some() && self.settings.replay.auto_start))
+    }
+
+    fn host(&self) -> Option<Host> {
+        let has = |slot: &Slot| {
+            slot.lock()
+                .as_ref()
+                .is_some_and(|p| p.shared.session.lock().is_some())
+        };
+        if has(&self.recorder) {
+            Some(Host::Recorder)
+        } else if has(&self.replay) {
+            Some(Host::Replay)
+        } else {
+            None
+        }
     }
 
     fn is_recording(&self) -> bool {
-        self.pipeline
-            .lock()
-            .as_ref()
-            .is_some_and(|p| p.shared.session.lock().is_some())
+        self.host().is_some()
+    }
+
+    /// Refuses an action outside games unless desktop capture is enabled.
+    fn check_capture_allowed(&self, what: &str) -> bool {
+        if self.game.is_some() || self.desktop_allowed() {
+            return true;
+        }
+        self.notice(
+            true,
+            format!("No game is running – {what} is off outside games (Settings › Recording › Desktop capture)."),
+        );
+        false
     }
 
     fn handle(&mut self, cmd: Cmd) {
@@ -346,31 +582,35 @@ impl Worker {
             Cmd::Settings(s) => self.apply_settings(s),
             Cmd::Game(g) => {
                 let changed = g.as_ref().map(|x| x.pid) != self.game.as_ref().map(|x| x.pid);
+                let ended = g.is_none();
                 self.game = g;
                 if !changed {
                     return;
                 }
                 self.degraded = false;
-                if self.is_recording() {
-                    if self.game.is_none() {
-                        // Game closed: finish the session with it.
-                        self.stop_pipeline(true);
-                        if self.wants_pipeline() {
-                            self.start_pipeline();
-                        }
-                    }
+                if self.is_recording() && !ended {
+                    // Switched games mid-recording: keep recording.
                     return;
                 }
                 self.stop_pipeline(true);
-                if self.wants_pipeline() {
-                    self.start_pipeline();
+                if ended {
+                    self.announced = None;
                 }
+                self.after_game_change();
             }
             Cmd::StartManual => {
+                if !self.desktop_allowed() && self.game.is_none() {
+                    self.check_capture_allowed("desktop capture");
+                    return;
+                }
                 self.manual = true;
                 self.paused = false;
-                if self.pipeline.lock().is_none() {
-                    self.start_pipeline();
+                if self.replay.lock().is_none() {
+                    if self.settings.replay.enabled {
+                        self.start_pipeline();
+                    } else {
+                        self.notice(true, "The replay buffer is disabled in settings");
+                    }
                 }
             }
             Cmd::StopCapture => {
@@ -388,9 +628,7 @@ impl Worker {
                     self.notice(false, "Capture paused");
                 } else {
                     self.notice(false, "Capture resumed");
-                    if self.wants_pipeline() {
-                        self.start_pipeline();
-                    }
+                    self.after_game_change();
                 }
             }
             Cmd::ReprobeEncoders => {
@@ -399,6 +637,52 @@ impl Worker {
                 self.spawn_probe();
             }
             Cmd::Shutdown => {}
+        }
+    }
+
+    /// (Re)starts what the current game and settings call for: the replay
+    /// buffer and, with full-session recording, a recording.
+    fn after_game_change(&mut self) {
+        if self.paused {
+            return;
+        }
+        if self.wants_pipeline() && self.replay.lock().is_none() {
+            self.start_pipeline();
+        }
+        if self.game.is_some()
+            && self.settings.recording.auto_record_sessions
+            && !self.is_recording()
+        {
+            self.start_recording();
+        }
+        // Popup once per game launch.
+        if let Some(g) = &self.game {
+            let running = self.replay.lock().is_some() || self.recorder.lock().is_some();
+            if running && self.announced != Some(g.pid) {
+                self.announced = Some(g.pid);
+                let mut parts = Vec::new();
+                if self.replay.lock().is_some() {
+                    let key = &self.settings.hotkeys.save_replay;
+                    let secs = clock(self.settings.replay.duration_secs as f64);
+                    parts.push(if key.is_empty() {
+                        format!("Replay buffer on ({secs})")
+                    } else {
+                        format!("{key} saves the last {secs}")
+                    });
+                }
+                if self.is_recording() {
+                    parts.push("recording this session".into());
+                }
+                self.emit(toast(
+                    if self.is_recording() {
+                        ToastKind::RecordStart
+                    } else {
+                        ToastKind::Ready
+                    },
+                    format!("Capturing {}", g.display_name),
+                    Some(parts.join(" · ")),
+                ));
+            }
         }
     }
 
@@ -413,27 +697,75 @@ impl Worker {
             );
             return;
         }
-        // Live volume changes.
-        if let Some(p) = self.pipeline.lock().as_ref() {
-            for t in s.audio.input_tracks() {
-                p.set_volume(&t.title, t.volume, t.muted);
-                p.set_gate(&t.title, t.gate_db);
+        // Live volume / gate changes.
+        for slot in [&self.replay, &self.recorder] {
+            if let Some(p) = slot.lock().as_ref() {
+                for t in s.audio.input_tracks() {
+                    p.set_volume(&t.title, t.volume, t.muted);
+                    p.set_gate(&t.title, t.gate_db);
+                }
             }
         }
+        let desktop_turned_off = self.desktop_allowed() && !s.video.allow_desktop_capture;
         self.settings = *s;
-        if restart {
+        if desktop_turned_off && self.game.is_none() {
+            self.manual = false;
             self.stop_pipeline(true);
+            return;
         }
-        if self.wants_pipeline() && self.pipeline.lock().is_none() {
+        if restart {
+            self.stop_replay(true);
+        }
+        if self.wants_pipeline() && self.replay.lock().is_none() {
             self.start_pipeline();
-        } else if !self.wants_pipeline() && !self.is_recording() {
-            self.stop_pipeline(true);
+        } else if !self.wants_pipeline() && self.host() != Some(Host::Replay) {
+            self.stop_replay(true);
+        }
+        if self.game.is_some()
+            && self.settings.recording.auto_record_sessions
+            && !self.is_recording()
+            && !self.paused
+        {
+            self.start_recording();
         }
     }
 
     fn tick(&mut self) {
+        // Stop the settings-page audio monitor when nobody is looking.
+        {
+            let mut m = self.monitor.lock();
+            if m.as_ref()
+                .is_some_and(|mon| mon.last_poll.elapsed() > MONITOR_IDLE)
+            {
+                *m = None;
+            }
+        }
+        // Recorder health: a dead recorder ends the recording.
+        let recorder_dead = {
+            let mut g = self.recorder.lock();
+            match g.as_mut() {
+                Some(p) => !p.is_running() || p.shared.stalled(Duration::from_secs(8)),
+                None => false,
+            }
+        };
+        if recorder_dead {
+            let msg = self
+                .recorder
+                .lock()
+                .as_ref()
+                .map(|p| p.shared.stderr_summary())
+                .unwrap_or_default();
+            self.notice(true, format!("Recording stopped unexpectedly: {msg}"));
+            self.emit(toast(
+                ToastKind::Error,
+                "Recording stopped unexpectedly",
+                None,
+            ));
+            self.stop_recorder(true);
+        }
+
         let dead = {
-            let mut guard = self.pipeline.lock();
+            let mut guard = self.replay.lock();
             match guard.as_mut() {
                 Some(p) if p.shared.stalled(Duration::from_secs(8)) => {
                     // Running but producing nothing (typically a window that
@@ -452,11 +784,11 @@ impl Worker {
         if let Some(err) = dead {
             self.last_error = Some(format!("Capture stopped unexpectedly: {err}"));
             self.notice(true, self.last_error.clone().unwrap_or_default());
-            self.stop_pipeline(true);
+            self.stop_replay(true);
             self.next_restart = Some(Instant::now() + self.restart_backoff);
             self.restart_backoff = (self.restart_backoff * 2).min(Duration::from_secs(60));
         }
-        if self.pipeline.lock().is_none()
+        if self.replay.lock().is_none()
             && self.wants_pipeline()
             && self.next_restart.is_none_or(|t| Instant::now() >= t)
         {
@@ -581,13 +913,14 @@ impl Worker {
             .map(|p| p.to_string_lossy().into_owned())
     }
 
-    fn start_pipeline(&mut self) {
+    /// Starts an encoder pipeline at `quality`, trying encoders, capture
+    /// sources and the focus screen from best to most compatible.
+    fn launch(&mut self, quality: Quality, ring: RingPlan) -> Result<Pipeline, String> {
         let Some(ff) = self.ff.clone() else {
-            self.last_error = Some("FFmpeg is missing; capture is unavailable".into());
-            return;
+            return Err("FFmpeg is missing; capture is unavailable".into());
         };
-        self.status.write().state = CaptureState::Starting;
-        self.publish();
+        // Free the settings-page audio monitor (it would double-capture).
+        self.monitor.lock().take();
         // Wait (bounded) for the encoder probe so the first start picks a
         // working hardware encoder.
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -597,41 +930,16 @@ impl Worker {
         let (caps, probed) = self.probe.read().clone().unwrap_or_default();
 
         let s = self.settings.clone();
-        let temp_dir = self.temp_dir.clone();
         let targets = self.resolve_targets(&caps);
         let font = Self::focus_font(&caps);
-        let layout = s.audio.track_layout();
         let audio = AudioPlan {
-            layout,
+            layout: s.audio.track_layout(),
             game_pid: self.game.as_ref().map(|g| g.pid),
             mic_device: s.audio.mic.device_id.clone(),
             system_fallback: s
                 .audio
                 .system_audio_fallback
                 .unwrap_or(!gc_platform::system::supports_process_loopback()),
-        };
-        let replay_secs = if s.replay.enabled {
-            s.replay.duration_secs
-        } else {
-            3
-        };
-        let storage = s.replay.effective_storage(s.video.peak_kbps());
-        let ring_plan = || RingPlan {
-            window: Duration::from_secs(replay_secs as u64 + 2),
-            store: match storage {
-                BufferStorage::Disk => Store::Disk(
-                    s.replay
-                        .disk_dir
-                        .clone()
-                        .unwrap_or_else(|| temp_dir.clone()),
-                ),
-                _ => Store::Memory,
-            },
-            max_bytes: if storage == BufferStorage::Disk {
-                u64::MAX
-            } else {
-                s.replay.max_memory_mb as u64 * 1024 * 1024
-            },
         };
 
         let mut errors = Vec::new();
@@ -658,11 +966,11 @@ impl Worker {
                         let spec = PipelineSpec {
                             video: target.video.clone(),
                             source_size: target.size,
-                            fps: s.video.fps,
-                            resolution: s.video.resolution,
+                            fps: quality.fps,
+                            resolution: quality.resolution,
                             backend,
                             codec,
-                            rate: s.video.rate_control,
+                            rate: quality.rate_control,
                             zero_copy,
                             gpu_scaler: caps.gpu_scaler(backend),
                             has_scale_d3d11: caps.has_filter("scale_d3d11"),
@@ -677,7 +985,7 @@ impl Worker {
                         if zero_copy && !spec.is_zero_copy() {
                             continue; // identical to the download variant
                         }
-                        let started = Pipeline::start(&ff, spec, &audio, ring_plan(), game_pid)
+                        let started = Pipeline::start(&ff, spec, &audio, ring.clone(), game_pid)
                             .and_then(|mut p| {
                                 p.wait_healthy(Duration::from_secs(8))?;
                                 Ok(p)
@@ -699,11 +1007,7 @@ impl Worker {
                                 }
                                 self.current_encoder = Some((backend, codec));
                                 self.capture_label = Some(target.label);
-                                *self.pipeline.lock() = Some(p);
-                                self.last_error = None;
-                                self.restart_backoff = Duration::from_secs(2);
-                                self.next_restart = None;
-                                return;
+                                return Ok(p);
                             }
                             Err(e) => {
                                 log::warn!(
@@ -717,18 +1021,66 @@ impl Worker {
                 }
             }
         }
-        self.last_error = Some(format!(
+        Err(format!(
             "Could not start capture. {}",
             errors.last().cloned().unwrap_or_default()
-        ));
-        self.notice(true, self.last_error.clone().unwrap_or_default());
-        self.next_restart = Some(Instant::now() + self.restart_backoff);
-        self.restart_backoff = (self.restart_backoff * 2).min(Duration::from_secs(60));
+        ))
     }
 
-    /// Stops the pipeline; finalises any session in the background.
-    fn stop_pipeline(&mut self, finalize: bool) {
-        let p = self.pipeline.lock().take();
+    fn start_pipeline(&mut self) {
+        self.status.write().state = CaptureState::Starting;
+        self.publish();
+        let s = self.settings.clone();
+        let quality = s.replay.quality;
+        let storage = s.replay.effective_storage(quality.peak_kbps());
+        let ring = RingPlan {
+            window: Duration::from_secs(s.replay.duration_secs as u64 + 2),
+            store: match storage {
+                BufferStorage::Disk => Store::Disk(
+                    s.replay
+                        .disk_dir
+                        .clone()
+                        .unwrap_or_else(|| self.temp_dir.clone()),
+                ),
+                _ => Store::Memory,
+            },
+            max_bytes: if storage == BufferStorage::Disk {
+                u64::MAX
+            } else {
+                s.replay.max_memory_mb as u64 * 1024 * 1024
+            },
+        };
+        match self.launch(quality, ring) {
+            Ok(p) => {
+                *self.replay.lock() = Some(p);
+                self.replay_quality = Some(quality);
+                self.last_error = None;
+                self.restart_backoff = Duration::from_secs(2);
+                self.next_restart = None;
+                if self.game.is_none() {
+                    self.emit(toast(
+                        ToastKind::Ready,
+                        "Capturing the desktop",
+                        Some(format!(
+                            "{} saves the last {}",
+                            self.settings.hotkeys.save_replay,
+                            clock(self.settings.replay.duration_secs as f64)
+                        )),
+                    ));
+                }
+            }
+            Err(e) => {
+                self.last_error = Some(e.clone());
+                self.notice(true, e);
+                self.next_restart = Some(Instant::now() + self.restart_backoff);
+                self.restart_backoff = (self.restart_backoff * 2).min(Duration::from_secs(60));
+            }
+        }
+    }
+
+    fn stop_replay(&mut self, finalize: bool) {
+        let p = self.replay.lock().take();
+        self.replay_quality = None;
         if let Some(p) = p {
             if let Some(session) = p.stop() {
                 if finalize {
@@ -736,6 +1088,23 @@ impl Worker {
                 }
             }
         }
+    }
+
+    fn stop_recorder(&mut self, finalize: bool) {
+        let p = self.recorder.lock().take();
+        if let Some(p) = p {
+            if let Some(session) = p.stop() {
+                if finalize {
+                    self.finish_session(session);
+                }
+            }
+        }
+    }
+
+    /// Stops all pipelines; finalises any session in the background.
+    fn stop_pipeline(&mut self, finalize: bool) {
+        self.stop_recorder(finalize);
+        self.stop_replay(finalize);
         if let Some(s) = self.pending.take() {
             self.settings = *s;
         }
@@ -758,6 +1127,7 @@ impl Worker {
                     error: true,
                     message: format!("Saving the recording failed: {e}"),
                 });
+                let _ = events.send(toast(ToastKind::Error, "Saving the recording failed", None));
             }
         };
         if self.shutting_down {
@@ -788,11 +1158,14 @@ impl Worker {
             self.notice(true, "Replay buffer is disabled in settings");
             return;
         }
+        if !self.check_capture_allowed("the replay buffer") {
+            return;
+        }
         let Some(ff) = self.ff.clone() else { return };
-        let guard = self.pipeline.lock();
+        let guard = self.replay.lock();
         let Some(p) = guard.as_ref() else {
             drop(guard);
-            self.notice(true, "Replay buffer is not running (no game detected). Start capture from the tray or dashboard.");
+            self.notice(true, "The replay buffer is not running yet.");
             return;
         };
         let secs = self.settings.replay.duration_secs as f64;
@@ -833,7 +1206,7 @@ impl Worker {
         let temp_dir = self.temp_dir.clone();
         let events = self.events.clone();
         let game = meta.game_title.clone();
-        self.notice(false, format!("Saving last {} s…", secs as u32));
+        let saved_len = clock(span.min(secs));
         std::thread::spawn(move || {
             let result = (|| -> anyhow::Result<()> {
                 if let Some(d) = out.parent() {
@@ -864,6 +1237,11 @@ impl Worker {
             })();
             match result {
                 Ok(()) => {
+                    let _ = events.send(toast(
+                        ToastKind::Saved,
+                        format!("Saved last {saved_len}"),
+                        game.clone(),
+                    ));
                     let _ = events.send(EngineEvent::Saved(SavedMedia {
                         path: out,
                         kind: MediaKind::Clip,
@@ -876,40 +1254,57 @@ impl Worker {
                         error: true,
                         message: format!("Saving the replay failed: {e}"),
                     });
+                    let _ = events.send(toast(ToastKind::Error, "Saving the replay failed", None));
                 }
             }
         });
     }
 
     fn toggle_recording(&mut self) {
-        // Stop?
-        let existing = self
-            .pipeline
-            .lock()
-            .as_ref()
-            .and_then(|p| p.shared.session.lock().take());
-        if let Some(session) = existing {
-            self.notice(false, "Recording stopped – saving…");
-            self.finish_session(session);
-            if let Some(s) = self.pending.take() {
-                self.apply_settings(s);
-            }
-            if !self.wants_pipeline() {
-                self.stop_pipeline(true);
-            }
+        if self.is_recording() {
+            self.stop_recording();
+        } else {
+            self.start_recording();
+        }
+    }
+
+    /// Starts a session recording. It shares the replay buffer's encoder when
+    /// both use the same quality; otherwise a second encoder runs for the
+    /// recording only.
+    fn start_recording(&mut self) {
+        if !self.check_capture_allowed("recording") {
             return;
         }
-        // Start (capture desktop if no game is running).
-        if self.pipeline.lock().is_none() {
-            self.manual = self.game.is_none() || self.manual;
-            self.start_pipeline();
-        }
-        let guard = self.pipeline.lock();
-        let Some(p) = guard.as_ref() else {
-            drop(guard);
-            self.notice(true, "Cannot record: capture failed to start");
-            return;
+        let quality = self.settings.video.quality;
+        let shared = self.replay.lock().is_some() && self.replay_quality == Some(quality);
+        let host = if shared {
+            Host::Replay
+        } else {
+            self.status.write().state = CaptureState::Starting;
+            self.publish();
+            let ring = RingPlan {
+                window: Duration::from_secs(3),
+                store: Store::Memory,
+                max_bytes: 512 << 20,
+            };
+            match self.launch(quality, ring) {
+                Ok(p) => {
+                    *self.recorder.lock() = Some(p);
+                    Host::Recorder
+                }
+                Err(e) => {
+                    self.notice(true, format!("Cannot record: {e}"));
+                    self.emit(toast(ToastKind::Error, "Recording could not start", None));
+                    return;
+                }
+            }
         };
+        let slot = match host {
+            Host::Replay => self.replay.clone(),
+            Host::Recorder => self.recorder.clone(),
+        };
+        let guard = slot.lock();
+        let Some(p) = guard.as_ref() else { return };
         let now = Local::now();
         let meta = self.base_meta(MediaKind::Session, now, p);
         let ext = self.settings.video.container.extension();
@@ -920,53 +1315,97 @@ impl Worker {
             MediaKind::Session,
             ext,
         );
+        let game = meta.game_title.clone();
         match SessionWriter::create(out, meta, p.audio_titles.clone()) {
             Ok(w) => {
                 *p.shared.session.lock() = Some(w);
                 drop(guard);
                 self.notice(false, "Recording started");
+                // The launch popup already announces auto-recordings.
+                if self.announced.is_some() || self.game.is_none() {
+                    self.emit(toast(ToastKind::RecordStart, "Recording started", game));
+                }
             }
             Err(e) => {
                 drop(guard);
                 self.notice(true, format!("Cannot start recording: {e}"));
+                if host == Host::Recorder {
+                    self.stop_recorder(false);
+                }
             }
+        }
+    }
+
+    fn stop_recording(&mut self) {
+        let secs = self.status.read().recording_secs;
+        match self.host() {
+            Some(Host::Recorder) => self.stop_recorder(true),
+            Some(Host::Replay) => {
+                let session = self
+                    .replay
+                    .lock()
+                    .as_ref()
+                    .and_then(|p| p.shared.session.lock().take());
+                if let Some(s) = session {
+                    self.finish_session(s);
+                }
+            }
+            None => return,
+        }
+        self.notice(false, "Recording stopped – saving…");
+        self.emit(toast(
+            ToastKind::RecordStop,
+            "Recording saved",
+            Some(format!("{} recorded", clock(secs))),
+        ));
+        if let Some(s) = self.pending.take() {
+            self.apply_settings(s);
+        }
+        if !self.wants_pipeline() {
+            self.stop_replay(true);
         }
     }
 
     fn bookmark(&mut self) {
-        let guard = self.pipeline.lock();
-        let Some(p) = guard.as_ref() else {
-            drop(guard);
+        let replay_t = self.replay.lock().as_ref().map(|p| {
+            let t = p.shared.now_media_time();
+            p.shared.bookmarks.lock().push(t);
+            t
+        });
+        let offset = match self.host() {
+            Some(host) => {
+                let slot = if host == Host::Replay {
+                    &self.replay
+                } else {
+                    &self.recorder
+                };
+                slot.lock().as_ref().and_then(|p| {
+                    let t = p.shared.now_media_time();
+                    p.shared
+                        .session
+                        .lock()
+                        .as_mut()
+                        .and_then(|s| s.add_bookmark(t, None).ok())
+                })
+            }
+            None => None,
+        };
+        if replay_t.is_none() && offset.is_none() {
             self.notice(true, "Nothing is being captured – bookmark ignored");
             return;
-        };
-        let now_t = p.shared.now_media_time();
-        p.shared.bookmarks.lock().push(now_t);
-        let offset = p
-            .shared
-            .session
-            .lock()
-            .as_mut()
-            .and_then(|s| s.add_bookmark(now_t, None).ok());
-        drop(guard);
-        match offset {
-            Some(ms) => {
-                let s = ms / 1000;
-                self.notice(
-                    false,
-                    format!(
-                        "Bookmark added at {:02}:{:02}:{:02}",
-                        s / 3600,
-                        s / 60 % 60,
-                        s % 60
-                    ),
-                );
-            }
-            None => self.notice(false, "Bookmark added"),
         }
+        let text = match offset {
+            Some(ms) => format!("Bookmark added at {}", clock(ms as f64 / 1000.0)),
+            None => "Bookmark added".to_string(),
+        };
+        self.notice(false, text.clone());
+        self.emit(toast(ToastKind::Bookmark, text, None));
     }
 
     fn screenshot(&mut self) {
+        if !self.check_capture_allowed("screenshots") {
+            return;
+        }
         let Some(shot) = self.shot_target() else {
             self.notice(true, "Screenshots need Windows Desktop Duplication");
             return;
@@ -985,6 +1424,11 @@ impl Worker {
         std::thread::spawn(
             move || match screenshot::capture(shot, fmt, quality, &out) {
                 Ok(_) => {
+                    let _ = events.send(toast(
+                        ToastKind::Screenshot,
+                        "Screenshot saved",
+                        game.clone(),
+                    ));
                     let _ = events.send(EngineEvent::Saved(SavedMedia {
                         path: out,
                         kind: MediaKind::Screenshot,
@@ -1003,26 +1447,32 @@ impl Worker {
 
     fn publish(&self) {
         let st = {
-            let guard = self.pipeline.lock();
+            let replay = self.replay.lock();
+            let recorder = self.recorder.lock();
             let mut s = self.status.write();
             s.game = self.game.clone();
             s.replay_enabled = self.settings.replay.enabled;
-            s.fps = self.settings.video.fps.0;
             s.last_error = self.last_error.clone();
             s.ffmpeg_found = self.ff.is_some();
             s.pending_restart = self.pending.is_some();
-            match guard.as_ref() {
+            s.desktop_capture = self.desktop_allowed();
+            // The session, wherever it is.
+            let session_secs = [replay.as_ref(), recorder.as_ref()]
+                .into_iter()
+                .flatten()
+                .find_map(|p| {
+                    let t = p.shared.now_media_time();
+                    p.shared.session.lock().as_ref().map(|w| w.elapsed(t))
+                });
+            s.recording_secs = session_secs.unwrap_or(0.0);
+            match replay.as_ref().or(recorder.as_ref()) {
                 Some(p) => {
-                    let now_t = p.shared.now_media_time();
-                    let session = p.shared.session.lock();
-                    s.recording_secs = session.as_ref().map(|w| w.elapsed(now_t)).unwrap_or(0.0);
-                    s.state = if session.is_some() {
+                    s.state = if session_secs.is_some() {
                         CaptureState::Recording
                     } else {
                         CaptureState::Buffering
                     };
-                    drop(session);
-                    s.buffer = Some(p.shared.ring.lock().stats());
+                    s.buffer = replay.as_ref().map(|r| r.shared.ring.lock().stats());
                     s.encoder = Some(encoder_name(p.spec.backend, p.spec.codec).to_string());
                     s.encoder_label = Some(format!(
                         "{} {}",
@@ -1031,16 +1481,17 @@ impl Worker {
                     ));
                     s.zero_copy = p.spec.is_zero_copy();
                     s.output_size = Some(p.spec.output_size());
+                    s.fps = p.spec.fps.0;
                     s.capture_source = self.capture_label.map(String::from);
                     s.focus_lost = p.focus_lost();
                 }
                 None => {
-                    s.recording_secs = 0.0;
                     s.buffer = None;
                     s.encoder = None;
                     s.encoder_label = None;
                     s.zero_copy = false;
                     s.output_size = None;
+                    s.fps = self.settings.replay.quality.fps.0;
                     s.capture_source = None;
                     s.focus_lost = false;
                     s.state = if self.paused {
@@ -1055,5 +1506,15 @@ impl Worker {
             s.clone()
         };
         let _ = self.events.send(EngineEvent::Status(st));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn clock_format() {
+        assert_eq!(super::clock(125.4), "2:05");
+        assert_eq!(super::clock(59.6), "1:00");
+        assert_eq!(super::clock(3725.0), "1:02:05");
     }
 }

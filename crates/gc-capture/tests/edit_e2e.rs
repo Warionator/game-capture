@@ -114,6 +114,7 @@ fn trim_mute_overwrite_and_copy() {
             },
         ]),
         overwrite: false,
+        as_clip: false,
     };
     let copy = export_clip(&ff, &clip, &req, meta.clone(), dir.path()).unwrap();
     assert!(copy.ends_with("2026-11-04_13-37-00_Clip_edit.mp4"));
@@ -136,6 +137,31 @@ fn trim_mute_overwrite_and_copy() {
     assert_eq!(m.duration_ms, 4_000);
     assert_eq!(info.chapters_ms, [0, 2_000]);
 
+    // "+ Clip": cut a moment into a new clip next to the source.
+    let clip_out = export_clip(
+        &ff,
+        &clip,
+        &ExportRequest {
+            start_ms: 3_000,
+            end_ms: 5_000,
+            gains: None,
+            overwrite: false,
+            as_clip: true,
+        },
+        meta.clone(),
+        dir.path(),
+    )
+    .unwrap();
+    let name = clip_out.file_name().unwrap().to_str().unwrap().to_string();
+    assert!(
+        name.ends_with("_Clip.mp4") && name != "2026-11-04_13-37-00_Clip.mp4",
+        "{name}"
+    );
+    assert_eq!(clip_out.parent(), clip.parent());
+    let m = ClipMetadata::from_tags(&probe(&ff, &clip_out).unwrap().tags).unwrap();
+    assert_eq!(m.kind, MediaKind::Clip);
+    assert_eq!(m.bookmarks[0].offset_ms, 1_000);
+
     // Overwrite: trim only, audio untouched.
     let before = std::fs::metadata(&clip).unwrap().len();
     let out = export_clip(
@@ -146,6 +172,7 @@ fn trim_mute_overwrite_and_copy() {
             end_ms: 3_000,
             gains: None,
             overwrite: true,
+            as_clip: false,
         },
         meta,
         dir.path(),

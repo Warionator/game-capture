@@ -1007,6 +1007,8 @@ pub struct ProbeInfo {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub video_codec: Option<String>,
+    /// Average video frame rate.
+    pub fps: Option<f64>,
     pub audio_tracks: Vec<String>,
     pub tags: BTreeMap<String, String>,
     /// Chapter start offsets (ms) – bookmarks written by us or other tools.
@@ -1029,6 +1031,7 @@ pub fn parse_probe(json: &str) -> anyhow::Result<ProbeInfo> {
         codec_name: Option<String>,
         width: Option<u32>,
         height: Option<u32>,
+        avg_frame_rate: Option<String>,
         #[serde(default)]
         tags: BTreeMap<String, String>,
         #[serde(default)]
@@ -1064,6 +1067,11 @@ pub fn parse_probe(json: &str) -> anyhow::Result<ProbeInfo> {
                 info.width = s.width;
                 info.height = s.height;
                 info.video_codec = s.codec_name;
+                info.fps = s.avg_frame_rate.as_deref().and_then(|r| {
+                    let (n, d) = r.split_once('/')?;
+                    let (n, d) = (n.parse::<f64>().ok()?, d.parse::<f64>().ok()?);
+                    (d > 0.0 && n > 0.0).then(|| n / d)
+                });
             }
             Some("audio") => {
                 audio_n += 1;
@@ -1374,7 +1382,7 @@ mod tests {
     fn parses_probe_json() {
         let json = r#"{
           "streams": [
-            {"codec_type":"video","codec_name":"h264","width":1920,"height":1080},
+            {"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"avg_frame_rate":"60000/1001"},
             {"codec_type":"audio","codec_name":"aac","tags":{"title":"Master"}},
             {"codec_type":"audio","codec_name":"aac"}
           ],
@@ -1384,6 +1392,7 @@ mod tests {
         let p = parse_probe(json).unwrap();
         assert_eq!(p.duration_ms, 30_016);
         assert_eq!((p.width, p.height), (Some(1920), Some(1080)));
+        assert!((p.fps.unwrap() - 59.94).abs() < 0.01);
         assert_eq!(p.audio_tracks, ["Master", "Track 2"]);
         assert_eq!(p.chapters_ms, [12_000]);
         assert_eq!(p.tags["GAME_TITLE"], "Fortnite");

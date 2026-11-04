@@ -62,6 +62,8 @@ export const api = {
   hotkeyErrors: () => call<string[]>("hotkey_errors"),
   action: (name: Action) => call<void>("action", { name }),
   systemInfo: () => call<SystemInfo>("system_info"),
+  overlayReady: () => call<void>("overlay_ready"),
+  previewOverlay: () => call<void>("preview_overlay"),
 };
 
 export interface EventMap {
@@ -72,6 +74,7 @@ export interface EventMap {
   "scan-progress": boolean;
   navigate: string;
   game: unknown;
+  "overlay-toast": { toast: import("./types").OverlayToast; corner: import("./types").OverlayPosition };
 }
 
 export async function on<K extends keyof EventMap>(
@@ -108,8 +111,9 @@ export async function pickExecutable(): Promise<string | null> {
   return typeof r === "string" ? r : null;
 }
 
-export async function confirmDialog(message: string, title = "game-capture"): Promise<boolean> {
-  if (!inTauri) return window.confirm(message);
-  const { ask } = await import("@tauri-apps/plugin-dialog");
-  return ask(message, { title, kind: "warning" });
+/** Toggles OS fullscreen for the app window (the player uses it). */
+export async function setWindowFullscreen(on: boolean): Promise<void> {
+  if (!inTauri) return;
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  await getCurrentWindow().setFullscreen(on);
 }

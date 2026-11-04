@@ -164,6 +164,7 @@ pub fn init(app: &AppHandle, minimized: bool) -> anyhow::Result<()> {
                         EngineEvent::Notice { error, message } => {
                             let _ = app.emit("notice", Notice { error, message });
                         }
+                        EngineEvent::Toast(t) => crate::overlay::show_toast(&app, t),
                         EngineEvent::Saved(saved) => {
                             let label = saved.kind.label();
                             let _ = app.emit(
@@ -325,10 +326,39 @@ pub fn index_new_file(app: &AppHandle, state: &AppState, path: PathBuf) {
         &path,
     ) {
         Ok(item) => {
+            prefetch_tracks(state, &item);
             let _ = app.emit("media-added", item);
         }
         Err(e) => log::warn!("indexing {} failed: {e}", path.display()),
     }
+}
+
+/// Extracts the separate audio tracks of a new capture in the background, so
+/// "Audio tracks" in the player opens instantly.
+pub fn prefetch_tracks(state: &AppState, item: &gc_library::MediaItem) {
+    let n = item.audio_tracks.len();
+    let (Some(ff), true) = (state.ffmpeg.clone(), n > 1) else {
+        return;
+    };
+    let master = item.audio_tracks[0].eq_ignore_ascii_case("Master");
+    let indices: Vec<usize> = if master {
+        (1..n).collect()
+    } else {
+        (0..n).collect()
+    };
+    let key = format!("{}-{}", item.id, item.mtime_ms);
+    let (path, titles, cache) = (
+        item.path.clone(),
+        item.audio_tracks.clone(),
+        state.track_cache.clone(),
+    );
+    std::thread::spawn(move || {
+        if let Err(e) =
+            gc_capture::edit::extract_tracks(&ff, &path, &key, &titles, &indices, &cache)
+        {
+            log::debug!("track prefetch for {}: {e}", path.display());
+        }
+    });
 }
 
 pub fn run_scan(app: &AppHandle, state: &AppState) -> Option<gc_library::ScanReport> {

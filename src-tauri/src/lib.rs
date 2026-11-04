@@ -2,6 +2,7 @@
 
 mod commands;
 mod logger;
+mod overlay;
 mod state;
 mod tray;
 
@@ -24,6 +25,7 @@ pub fn run() {
             show_main(app)
         }))
         .plugin(tauri_plugin_dialog::init())
+        .manage(overlay::OverlayState::default())
         .setup(move |app| {
             state::init(app.handle(), minimized).map_err(|e| e.to_string())?;
             tray::create(app.handle())?;
@@ -71,6 +73,8 @@ pub fn run() {
             commands::hotkey_errors,
             commands::action,
             commands::system_info,
+            commands::overlay_ready,
+            commands::preview_overlay,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the tauri application")

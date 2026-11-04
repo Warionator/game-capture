@@ -40,6 +40,24 @@ SUGGESTED TEST PASS
   [ ] Settings > Replay buffer: type 4:30 in the length box -> saved clips are
       ~4.5 min long.
   [ ] Run ShareX (region capture) or OBS: they must NOT be detected as games.
+  [ ] Launch a game: a popup with a chime appears in the top-left corner
+      ("Capturing <game>"). It must not steal focus from the game. Save a
+      clip -> "Saved last 2:00" popup with a different chime. Settings > System
+      > In-game popups: change the corner, press Preview.
+  [ ] Settings > Recording: turn on "Record full sessions automatically",
+      start a game -> recording starts by itself; quit the game -> the
+      session is saved.
+  [ ] Set a different Recording quality vs. Clip quality (e.g. 1080p30 vs
+      1440p60): clips and recordings come out at their own settings.
+  [ ] With no game running: Record and Screenshot are disabled and the
+      hotkeys do nothing, unless Settings > Recording > "Allow capture
+      outside games" is on.
+  [ ] Settings > Audio with nothing capturing: the level meters still move.
+  [ ] Player: pause, press "Start crop", move on, "End crop" -> playback and
+      scrubbing stay inside the crop. Open a session, crop, press "+ Clip":
+      a new clip appears in the same game folder.
+  [ ] Player: "Audio tracks" opens instantly; fullscreen button (or F) works.
+  [ ] Delete / overwrite prompts are game-capture dialogs, not Windows boxes.
   [ ] Settings > Audio while capturing: level meters move; volume/mute act live.
   [ ] Right-click a clip: Open file location / Copy to clipboard (paste in
       Explorer or Discord) / Details / Delete.

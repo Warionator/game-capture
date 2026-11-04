@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Gallery } from "./components/Gallery";
 import { Sidebar, type View } from "./components/Sidebar";
 import { StatusBar } from "./components/StatusBar";
+import { ConfirmHost } from "./components/ConfirmHost";
 import { Toasts } from "./components/Toasts";
 import { api, on } from "./lib/api";
 import { StoreProvider, useStore } from "./lib/store";
@@ -32,6 +33,7 @@ function Shell() {
         {view === "library" ? <Gallery game={game} onLibraryChanged={loadGames} /> : <SettingsPage />}
       </main>
       <Toasts />
+      <ConfirmHost />
     </div>
   );
 }

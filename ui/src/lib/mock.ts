@@ -16,6 +16,9 @@ function emit(event: string, payload: unknown) {
   listeners.get(event)?.forEach((h) => h(payload));
 }
 
+// Dev hook: lets UI checks push backend events (e.g. overlay popups).
+(globalThis as { __gcMockEmit?: typeof emit }).__gcMockEmit = emit;
+
 const HOUR = 3_600_000;
 const now = Date.now();
 
@@ -81,6 +84,7 @@ let settings: Settings = {
   video: {
     captureMode: "window",
     focusScreen: true,
+    allowDesktopCapture: false,
     resolution: "native",
     fps: 60,
     encoder: "auto",
@@ -91,7 +95,15 @@ let settings: Settings = {
     captureCursor: false,
     zeroCopy: true,
   },
-  replay: { enabled: true, durationSecs: 120, storage: "auto", maxMemoryMb: 1024, diskDir: null, autoStart: true },
+  replay: {
+    enabled: true,
+    durationSecs: 120,
+    storage: "auto",
+    maxMemoryMb: 1024,
+    diskDir: null,
+    autoStart: true,
+    quality: { resolution: "1080p", fps: 60, rateControl: { mode: "vbr", bitrateKbps: 20000, maxKbps: 32000 } },
+  },
   audio: {
     mixdownEnabled: true,
     game: { enabled: true, volume: 1, muted: false },
@@ -117,6 +129,8 @@ let settings: Settings = {
     custom: [{ displayName: "Dolphin (GameCube)", executable: "Dolphin.exe", path: "C:\\Emulators\\Dolphin\\Dolphin.exe" }],
     excluded: [],
   },
+  recording: { autoRecordSessions: false },
+  overlay: { enabled: true, position: "topLeft", sound: true, volume: 0.6 },
 };
 
 let status: EngineStatus = {
@@ -136,6 +150,7 @@ let status: EngineStatus = {
   encodersProbed: true,
   captureSource: "Game window",
   focusLost: false,
+  desktopCapture: false,
 };
 
 setInterval(() => {
@@ -243,9 +258,17 @@ const handlers: Record<string, (a: Record<string, unknown>) => unknown> = {
     if (!m || m.audioTracks.length < 2) return [];
     return m.audioTracks.slice(1).map((title, i) => ({ index: i + 1, title, path: "" }));
   },
+  overlay_ready: () => undefined,
+  preview_overlay: () => notice("(mock) An in-game popup would appear now"),
   export_clip: (a) => {
     const m = media.find((x) => x.id === a.id)!;
-    const r = a.request as { startMs: number; endMs: number; overwrite: boolean };
+    const r = a.request as { startMs: number; endMs: number; overwrite: boolean; asClip?: boolean };
+    if (r.asClip) {
+      const clip: MediaItem = { ...m, id: nextId++, kind: "clip", durationMs: r.endMs - r.startMs, createdMs: m.createdMs + r.startMs, path: m.path.replace(/_Session\.(\w+)$/, "_Clip.$1"), bookmarks: [] };
+      media.unshift(clip);
+      setTimeout(() => emit("library-changed", {}), 50);
+      return clip;
+    }
     const out = { ...m, durationMs: r.endMs - r.startMs, mtimeMs: Date.now() };
     if (r.overwrite) Object.assign(m, out);
     else media.unshift({ ...out, id: nextId++, path: m.path.replace(/(\.\w+)$/, "_edit$1") });

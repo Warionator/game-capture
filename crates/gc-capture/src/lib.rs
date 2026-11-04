@@ -16,7 +16,8 @@ mod screenshot;
 mod session;
 
 pub use engine::{
-    CaptureEngine, CaptureState, EngineEvent, EnginePaths, EngineStatus, GameContext, SavedMedia,
+    clock, CaptureEngine, CaptureState, EngineEvent, EnginePaths, EngineStatus, GameContext,
+    SavedMedia, Toast, ToastKind,
 };
 pub use ffmpeg::{probe_encoders, EncoderInfo, Ffmpeg};
 pub use session::recover_sessions;

@@ -25,6 +25,10 @@ pub struct ExportRequest {
     pub gains: Option<Vec<TrackGain>>,
     /// Replace the original file instead of writing `<name>_edit.<ext>`.
     pub overwrite: bool,
+    /// Save the selection as a new *clip* next to the source (e.g. a moment
+    /// cut out of a long session), named after the moment it starts.
+    #[serde(default)]
+    pub as_clip: bool,
 }
 
 pub fn probe(ff: &Ffmpeg, path: &Path) -> anyhow::Result<ProbeInfo> {
@@ -60,6 +64,38 @@ pub fn copy_path(input: &Path) -> PathBuf {
         .map(|n| dir.join(format!("{stem}_edit_{n}.{ext}")))
         .find(|p| !p.exists())
         .expect("unbounded")
+}
+
+/// `<dir>/<YYYY-MM-DD_HH-MM-SS>_Clip.<ext>` for the moment a cut starts,
+/// next to the source; falls back to the source name with `_clip`.
+pub fn clip_path(input: &Path, timestamp: &str, ext: &str) -> PathBuf {
+    let dir = input.parent().unwrap_or(Path::new("."));
+    match chrono::DateTime::parse_from_rfc3339(timestamp) {
+        Ok(t) => {
+            let local = t.with_timezone(&chrono::Local);
+            let name = gc_core::naming::file_name(local, gc_core::metadata::MediaKind::Clip, ext);
+            let first = dir.join(&name);
+            if !first.exists() {
+                return first;
+            }
+            let stem = name.trim_end_matches(&format!(".{ext}")).to_string();
+            (2..)
+                .map(|n| dir.join(format!("{stem}_{n}.{ext}")))
+                .find(|p| !p.exists())
+                .expect("unbounded")
+        }
+        Err(_) => {
+            let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
+            let base = dir.join(format!("{stem}_clip.{ext}"));
+            if !base.exists() {
+                return base;
+            }
+            (2..)
+                .map(|n| dir.join(format!("{stem}_clip_{n}.{ext}")))
+                .find(|p| !p.exists())
+                .expect("unbounded")
+        }
+    }
 }
 
 /// Shifts bookmarks into the trimmed range.
@@ -120,7 +156,13 @@ pub fn export_clip(
     };
 
     let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
-    let out = if req.overwrite {
+    let as_clip = req.as_clip && !req.overwrite;
+    if as_clip {
+        meta.kind = gc_core::metadata::MediaKind::Clip;
+    }
+    let out = if as_clip {
+        clip_path(input, &meta.timestamp, ext)
+    } else if req.overwrite {
         let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
         input.with_file_name(format!(".{stem}.editing.{ext}"))
     } else {

@@ -2,7 +2,10 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Permissions for the main window",
-  "windows": ["main"],
+  "windows": [
+    "main",
+    "overlay"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-show",
@@ -10,6 +13,8 @@
     "core:window:allow-set-focus",
     "dialog:allow-open",
     "dialog:allow-ask",
-    "dialog:allow-message"
+    "dialog:allow-message",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-is-fullscreen"
   ]
 }

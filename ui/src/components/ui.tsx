@@ -9,10 +9,16 @@ export function Button({
   size = "md",
   className,
   children,
+  ref,
   ...rest
-}: React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: ButtonVariant; size?: "sm" | "md" }) {
+}: React.ButtonHTMLAttributes<HTMLButtonElement> & {
+  variant?: ButtonVariant;
+  size?: "sm" | "md";
+  ref?: React.Ref<HTMLButtonElement>;
+}) {
   return (
     <button
+      ref={ref}
       {...rest}
       className={cx(
         "inline-flex shrink-0 items-center justify-center gap-2 rounded-md font-medium whitespace-nowrap transition-colors disabled:cursor-not-allowed disabled:opacity-50",

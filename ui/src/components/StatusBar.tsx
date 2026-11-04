@@ -33,6 +33,8 @@ export function StatusBar() {
   const buf = status.buffer;
   const fill = buf && status.replayEnabled ? Math.min(1, buf.bufferedSecs / Math.max(1, buf.windowSecs - 2)) : 0;
   const hk = settings?.hotkeys;
+  // Outside games nothing is captured unless desktop capture is enabled.
+  const canCapture = !!status.game || status.desktopCapture;
 
   return (
     <div className="flex h-14 shrink-0 items-center gap-4 border-b border-line bg-panel px-4">
@@ -86,7 +88,10 @@ export function StatusBar() {
             ) : !status.ffmpegFound ? (
               <span className="text-amber-300/80">FFmpeg not found – reinstall to enable capture</span>
             ) : (
-              <span>Capture starts automatically when a game is detected</span>
+              <span>
+                Capture starts automatically when a game is detected
+                {!status.desktopCapture && " · nothing is captured outside games"}
+              </span>
             )}
           </div>
         </div>
@@ -119,6 +124,7 @@ export function StatusBar() {
         <Button
           variant={recording ? "record" : "secondary"}
           size="sm"
+          disabled={!recording && !canCapture}
           onClick={() => run("toggleRecording")}
           title={`${recording ? "Stop" : "Start"} recording (${hk?.toggleRecording || "no hotkey"})`}
         >
@@ -128,7 +134,11 @@ export function StatusBar() {
         <IconButton label={`Add bookmark (${hk?.addBookmark || "no hotkey"})`} disabled={!active} onClick={() => run("bookmark")}>
           <Bookmark size={16} />
         </IconButton>
-        <IconButton label={`Screenshot (${hk?.screenshot || "no hotkey"})`} onClick={() => run("screenshot")}>
+        <IconButton
+          label={canCapture ? `Screenshot (${hk?.screenshot || "no hotkey"})` : "Screenshots are off outside games"}
+          disabled={!canCapture}
+          onClick={() => run("screenshot")}
+        >
           <Camera size={16} />
         </IconButton>
         <div className="mx-1 h-6 w-px bg-line" />
@@ -141,7 +151,7 @@ export function StatusBar() {
             <Pause size={16} />
           </IconButton>
         )}
-        {!active && status.state !== "paused" && status.state !== "starting" && (
+        {!active && status.desktopCapture && status.state !== "paused" && status.state !== "starting" && (
           <Button size="sm" variant="ghost" onClick={() => run("startCapture")} title="Start the replay buffer on the desktop">
             <Monitor size={14} /> Capture desktop
           </Button>

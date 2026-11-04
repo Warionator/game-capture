@@ -13,7 +13,7 @@ import { VideoTab } from "./VideoTab";
 
 const TABS = [
   { id: "general", label: "General", icon: FolderCog, body: GeneralTab },
-  { id: "video", label: "Video", icon: Cpu, body: VideoTab },
+  { id: "video", label: "Recording", icon: Cpu, body: VideoTab },
   { id: "replay", label: "Replay buffer", icon: History, body: ReplayTab },
   { id: "audio", label: "Audio", icon: AudioLines, body: AudioTab },
   { id: "hotkeys", label: "Hotkeys", icon: Keyboard, body: HotkeysTab },

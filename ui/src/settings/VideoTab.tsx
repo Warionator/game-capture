@@ -32,6 +32,19 @@ export function VideoTab() {
 
   return (
     <>
+      <Section title="Session recording" description="Long recordings of whole play sessions, separate from replay clips.">
+        <Field
+          label="Record full sessions automatically"
+          hint="Starts recording when a game launches and saves it when the game closes. The replay buffer keeps working alongside."
+        >
+          <Toggle
+            label="Record full sessions"
+            checked={settings.recording.autoRecordSessions}
+            onChange={(b) => update((x) => void (x.recording.autoRecordSessions = b))}
+          />
+        </Field>
+      </Section>
+
       <Section
         title="Encoder"
         description="Frames go from the GPU framebuffer straight into the hardware encoder; no game hooks are injected."
@@ -83,8 +96,11 @@ export function VideoTab() {
         </Field>
       </Section>
 
-      <Section title="Quality">
-        <QualityFields />
+      <Section
+        title="Recording quality"
+        description="Used for session recordings. Clips have their own quality in the Replay buffer tab; if both match, one encoder serves both."
+      >
+        <QualityFields target="recording" />
         <Field label="Container" hint="MKV survives crashes mid-write; MP4 is the most compatible for sharing.">
           <Select
             label="Container"
@@ -99,6 +115,16 @@ export function VideoTab() {
       </Section>
 
       <Section title="Capture source">
+        <Field
+          label="Allow capture outside games"
+          hint="Off: nothing is captured unless a game is running – no replay buffer, recordings or screenshots of your desktop."
+        >
+          <Toggle
+            label="Desktop capture"
+            checked={v.allowDesktopCapture}
+            onChange={(b) => update((x) => void (x.video.allowDesktopCapture = b))}
+          />
+        </Field>
         <Field
           label="Capture games by"
           hint="Game window records only the game itself, so other apps and notifications never appear. Monitor records the whole screen the game is on."

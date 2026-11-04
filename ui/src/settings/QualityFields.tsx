@@ -1,24 +1,30 @@
 import { useStore } from "../lib/store";
-import type { RateControl, Resolution } from "../lib/types";
+import type { Quality, RateControl, Resolution, Settings } from "../lib/types";
 import { Field, Select, Slider } from "../components/ui";
 
 const mbps = (kbps: number) => `${(kbps / 1000).toFixed(kbps < 10_000 ? 1 : 0)} Mbps`;
 
-/** Resolution, frame rate and bitrate controls (shown in both the Video and
- *  the Replay buffer tabs – they edit the same settings). */
-export function QualityFields() {
+/** The quality settings an output uses: clips (replay buffer) and session
+ *  recordings are configured independently. */
+function qualityOf(s: Settings, target: "replay" | "recording"): Quality {
+  return target === "replay" ? s.replay.quality : s.video;
+}
+
+/** Resolution, frame rate and bitrate controls for clips or recordings. */
+export function QualityFields({ target }: { target: "replay" | "recording" }) {
   const { settings, update } = useStore();
   if (!settings) return null;
-  const v = settings.video;
+  const v = qualityOf(settings, target);
+  const set = (fn: (q: Quality) => void) => update((x) => fn(qualityOf(x, target)));
   const rc = v.rateControl;
-  const setRc = (r: RateControl) => update((x) => void (x.video.rateControl = r));
+  const setRc = (r: RateControl) => set((q) => void (q.rateControl = r));
   return (
     <>
       <Field label="Resolution" hint="Downscaling happens on the GPU when supported. Never upscales.">
         <Select<Resolution>
           label="Resolution"
           value={v.resolution}
-          onChange={(val) => update((x) => void (x.video.resolution = val))}
+          onChange={(val) => set((q) => void (q.resolution = val))}
           options={[
             { value: "native", label: "Source (native)" },
             { value: "2160p", label: "4K (2160p)" },
@@ -32,7 +38,7 @@ export function QualityFields() {
         <Select<number>
           label="Frame rate"
           value={v.fps}
-          onChange={(val) => update((x) => void (x.video.fps = val))}
+          onChange={(val) => set((q) => void (q.fps = val))}
           options={[
             { value: 30, label: "30 fps" },
             { value: 60, label: "60 fps" },
