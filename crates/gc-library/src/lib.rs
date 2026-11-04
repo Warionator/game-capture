@@ -12,6 +12,6 @@ mod scan;
 
 pub use db::{GameSummary, Library, MediaFilter, MediaItem, SortOrder};
 pub use scan::{
-    index_file, item_from_probe, local_from_ms, scan, thumbnail_path, FfmpegInspector,
-    MediaInspector, ScanReport,
+    index_file, item_from_probe, local_from_ms, prune_outside, scan, thumbnail_path,
+    FfmpegInspector, MediaInspector, ScanReport,
 };

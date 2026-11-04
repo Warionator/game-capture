@@ -100,7 +100,7 @@ pub fn init(app: &AppHandle, minimized: bool) -> anyhow::Result<()> {
         })
     });
 
-    allow_asset_dirs(app, &settings.storage_root, &thumbs_dir);
+    allow_asset_dirs(app, &settings.library_roots(), &thumbs_dir);
 
     // --- capture engine --------------------------------------------------
     let (ev_tx, ev_rx) = unbounded::<EngineEvent>();
@@ -264,9 +264,10 @@ pub fn init(app: &AppHandle, minimized: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn allow_asset_dirs(app: &AppHandle, storage_root: &std::path::Path, thumbs: &std::path::Path) {
+/// Lets the webview load thumbnails and videos from the library folders.
+pub fn allow_asset_dirs(app: &AppHandle, roots: &[PathBuf], thumbs: &std::path::Path) {
     let scope = app.asset_protocol_scope();
-    for dir in [storage_root, thumbs] {
+    for dir in roots.iter().map(PathBuf::as_path).chain([thumbs]) {
         if let Err(e) = scope.allow_directory(dir, true) {
             log::warn!("asset scope for {}: {e}", dir.display());
         }
@@ -322,10 +323,10 @@ pub fn run_scan(app: &AppHandle, state: &AppState) -> Option<gc_library::ScanRep
         return None;
     }
     let _ = app.emit("scan-progress", true);
-    let root = state.settings.read().storage_root.clone();
+    let roots = state.settings.read().library_roots();
     let report = gc_library::scan(
         &state.library,
-        &root,
+        &roots,
         &state.thumbs_dir,
         inspector.as_ref(),
         |_| {},

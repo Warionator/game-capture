@@ -17,7 +17,11 @@ pub const BITRATE_MAX_KBPS: u32 = 100_000;
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     /// Root of the media library (`<root>/<Game>/<timestamp>_Clip.mp4`).
+    /// New captures are written here.
     pub storage_root: PathBuf,
+    /// Extra folders the user explicitly added to the gallery (e.g. clips
+    /// from another recorder). Indexed read-only; nothing is written there.
+    pub extra_library_folders: Vec<PathBuf>,
     pub video: VideoSettings,
     pub replay: ReplaySettings,
     pub audio: AudioSettings,
@@ -31,6 +35,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             storage_root: default_storage_root(),
+            extra_library_folders: Vec::new(),
             video: VideoSettings::default(),
             replay: ReplaySettings::default(),
             audio: AudioSettings::default(),
@@ -82,6 +87,21 @@ impl Settings {
         std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
+    }
+
+    /// Every folder the gallery shows: the library root first, then the
+    /// user-added folders (duplicates and nested repeats removed).
+    pub fn library_roots(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        for p in std::iter::once(&self.storage_root).chain(&self.extra_library_folders) {
+            if p.as_os_str().is_empty() || out.iter().any(|r| crate::naming::is_under(p, r)) {
+                continue;
+            }
+            // A newly added parent folder supersedes folders inside it.
+            out.retain(|r| !crate::naming::is_under(r, p));
+            out.push(p.clone());
+        }
+        out
     }
 
     /// Clamps every numeric option into its supported range.
@@ -780,6 +800,24 @@ mod tests {
         std::fs::write(&p, "not json").unwrap();
         assert_eq!(Settings::load_or_default(&p), Settings::default());
         assert!(p.with_extension("json.bak").exists());
+    }
+
+    #[test]
+    fn library_roots_dedupe() {
+        let s = Settings {
+            storage_root: PathBuf::from("D:/Captures"),
+            extra_library_folders: vec![
+                PathBuf::from("D:/Medal"),
+                PathBuf::from("d:/captures/Old"),
+                PathBuf::from("D:/medal"),
+                PathBuf::from(""),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            s.library_roots(),
+            [PathBuf::from("D:/Captures"), PathBuf::from("D:/Medal")]
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use gc_platform::{display, process, shell, system};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 type St<'a> = State<'a, Arc<AppState>>;
 type CmdResult<T> = Result<T, String>;
@@ -48,9 +48,15 @@ pub fn save_settings(app: AppHandle, state: St, settings: Settings) -> CmdResult
     }
     apply_system_settings(&new, Some(&prev));
     state.engine(|e| e.update_settings(new.clone()));
-    if new.storage_root != prev.storage_root {
+    let roots = new.library_roots();
+    if roots != prev.library_roots() {
         let _ = std::fs::create_dir_all(&new.storage_root);
-        allow_asset_dirs(&app, &new.storage_root, &state.thumbs_dir);
+        allow_asset_dirs(&app, &roots, &state.thumbs_dir);
+        // Hide everything outside the configured folders right away; the
+        // scan below then indexes whatever the new folders contain.
+        if gc_library::prune_outside(&state.library, &roots) > 0 {
+            let _ = app.emit("library-changed", ScanReport::default());
+        }
         let (app, state) = (app.clone(), state.inner().clone());
         std::thread::spawn(move || run_scan(&app, &state));
     }

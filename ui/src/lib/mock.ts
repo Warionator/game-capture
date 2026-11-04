@@ -77,6 +77,7 @@ for (let i = 0; i < 26; i++) {
 
 let settings: Settings = {
   storageRoot: "D:\\Videos\\game-capture",
+  extraLibraryFolders: [],
   video: {
     resolution: "native",
     fps: 60,

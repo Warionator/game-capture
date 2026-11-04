@@ -139,7 +139,7 @@ pub fn item_from_probe(
 
     let folder_game = path
         .parent()
-        .filter(|p| *p != root && p.starts_with(root))
+        .filter(|p| naming::is_under(p, root) && !naming::is_under(root, p))
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
         .filter(|n| !n.eq_ignore_ascii_case(naming::UNCATEGORIZED))
@@ -227,15 +227,44 @@ pub fn index_file(
     Ok(item)
 }
 
-/// Reconciles the index with the files under `root`.
+/// Removes index entries (and their cached thumbnails) for files that are
+/// not inside any of `roots`. The files themselves are never touched. Used
+/// when the library folder changes or an extra folder is removed, so the
+/// gallery only ever shows the configured folders.
+pub fn prune_outside(lib: &Mutex<Library>, roots: &[PathBuf]) -> u32 {
+    let db = lib.lock();
+    let Ok(known) = db.known_files() else {
+        return 0;
+    };
+    let mut removed = 0;
+    for (path, (id, _, _, thumb)) in known {
+        if !roots.iter().any(|r| naming::is_under(&path, r)) && db.remove(id).is_ok() {
+            removed += 1;
+            if let Some(t) = thumb {
+                let _ = std::fs::remove_file(t);
+            }
+        }
+    }
+    if removed > 0 {
+        log::info!("dropped {removed} index entries outside the library folders");
+    }
+    removed
+}
+
+/// Reconciles the index with the files under `roots` (the library folder
+/// plus user-added folders). Entries outside every root are dropped; entries
+/// under a root that is currently unreachable (unplugged drive) are kept.
 pub fn scan(
     lib: &Mutex<Library>,
-    root: &Path,
+    roots: &[PathBuf],
     thumbs_dir: &Path,
     inspector: &dyn MediaInspector,
     mut on_item: impl FnMut(&MediaItem),
 ) -> ScanReport {
-    let mut report = ScanReport::default();
+    let mut report = ScanReport {
+        removed: prune_outside(lib, roots),
+        ..ScanReport::default()
+    };
     let known = match lib.lock().known_files() {
         Ok(k) => k,
         Err(e) => {
@@ -244,8 +273,15 @@ pub fn scan(
         }
     };
 
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    if root.is_dir() {
+    for root in roots {
+        if !root.is_dir() {
+            report.errors.push(format!(
+                "folder {} is not reachable; its entries are kept",
+                root.display()
+            ));
+            continue;
+        }
+        let mut seen: HashSet<PathBuf> = HashSet::new();
         let walker = walkdir::WalkDir::new(root)
             .follow_links(false)
             .max_depth(4)
@@ -286,21 +322,14 @@ pub fn scan(
                 Err(e) => report.errors.push(format!("{}: {e}", path.display())),
             }
         }
-    } else {
-        report
-            .errors
-            .push(format!("library folder {} does not exist", root.display()));
-    }
 
-    // Drop entries whose files vanished — only those under this root, so a
-    // missing removable drive does not wipe the index of another root.
-    if root.is_dir() {
+        // Drop entries under this (reachable) root whose files vanished.
         let db = lib.lock();
-        for (path, (id, _, _, thumb)) in known {
-            if path.starts_with(root)
-                && !seen.contains(&path)
+        for (path, (id, _, _, thumb)) in &known {
+            if naming::is_under(path, root)
+                && !seen.contains(path)
                 && !path.exists()
-                && db.remove(id).is_ok()
+                && db.remove(*id).is_ok()
             {
                 report.removed += 1;
                 if let Some(t) = thumb {
@@ -310,8 +339,8 @@ pub fn scan(
         }
     }
     log::info!(
-        "library scan of {}: +{} ~{} -{} ={} ({} errors)",
-        root.display(),
+        "library scan of {:?}: +{} ~{} -{} ={} ({} errors)",
+        roots,
         report.added,
         report.updated,
         report.removed,
@@ -390,11 +419,12 @@ mod tests {
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(p, b"data").unwrap();
         }
+        let roots = vec![r.to_path_buf()];
         let lib = Mutex::new(Library::open_in_memory().unwrap());
         let fake = Fake {
             probes: AtomicU32::new(0),
         };
-        let rep = scan(&lib, r, thumbs.path(), &fake, |_| {});
+        let rep = scan(&lib, &roots, thumbs.path(), &fake, |_| {});
         assert_eq!(
             (rep.added, rep.removed, rep.unchanged),
             (4, 0, 0),
@@ -422,7 +452,7 @@ mod tests {
 
         // Second scan: nothing to do.
         let before = fake.probes.load(Ordering::SeqCst);
-        let rep = scan(&lib, r, thumbs.path(), &fake, |_| {});
+        let rep = scan(&lib, &roots, thumbs.path(), &fake, |_| {});
         assert_eq!((rep.added, rep.unchanged), (0, 4));
         assert_eq!(fake.probes.load(Ordering::SeqCst), before);
 
@@ -431,8 +461,93 @@ mod tests {
             std::fs::remove_file(e.unwrap().path()).unwrap();
         }
         std::fs::remove_file(r.join("Fortnite/2026-11-04_13-37-00_Clip.mp4")).unwrap();
-        let rep = scan(&lib, r, thumbs.path(), &fake, |_| {});
+        let rep = scan(&lib, &roots, thumbs.path(), &fake, |_| {});
         assert_eq!((rep.thumbnails_rebuilt, rep.removed), (3, 1), "{rep:?}");
         assert_eq!(lib.lock().count().unwrap(), 3);
+    }
+
+    #[test]
+    fn only_configured_folders_are_shown() {
+        let base = tempfile::tempdir().unwrap();
+        let thumbs = tempfile::tempdir().unwrap();
+        let captures = base.path().join("Captures");
+        let medal = base.path().join("Medal");
+        for p in [
+            medal.join("Clips/Fortnite/2026-11-01_10-00-00_Clip.mp4"),
+            medal.join("Clips/Valorant/2026-11-02_10-00-00_Clip.mp4"),
+            captures.join("Elden Ring/2026-11-04_13-37-00_Clip.mp4"),
+        ] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"data").unwrap();
+        }
+        let lib = Mutex::new(Library::open_in_memory().unwrap());
+        let fake = Fake {
+            probes: AtomicU32::new(0),
+        };
+        let count = || lib.lock().count().unwrap();
+
+        // Library pointed at Medal first, then switched to the empty-ish
+        // Captures folder: Medal's clips must disappear from the gallery.
+        scan(
+            &lib,
+            std::slice::from_ref(&medal),
+            thumbs.path(),
+            &fake,
+            |_| {},
+        );
+        assert_eq!(count(), 2);
+        let rep = scan(
+            &lib,
+            std::slice::from_ref(&captures),
+            thumbs.path(),
+            &fake,
+            |_| {},
+        );
+        assert_eq!((rep.removed, rep.added), (2, 1), "{rep:?}");
+        assert_eq!(count(), 1);
+        assert!(
+            medal
+                .join("Clips/Fortnite/2026-11-01_10-00-00_Clip.mp4")
+                .exists(),
+            "files untouched"
+        );
+
+        // Explicitly added as an extra folder: shown again.
+        let rep = scan(
+            &lib,
+            &[captures.clone(), medal.clone()],
+            thumbs.path(),
+            &fake,
+            |_| {},
+        );
+        assert_eq!(rep.added, 2);
+        let items = lib.lock().list(&Default::default()).unwrap();
+        let games: Vec<_> = items.iter().filter_map(|i| i.game_title.clone()).collect();
+        assert!(
+            games.contains(&"Fortnite".to_string()) && games.contains(&"Elden Ring".to_string())
+        );
+
+        // Removing it again prunes immediately, without a full scan.
+        assert_eq!(prune_outside(&lib, std::slice::from_ref(&captures)), 2);
+        assert_eq!(count(), 1);
+
+        // An unreachable folder (unplugged drive) keeps its entries.
+        scan(
+            &lib,
+            &[captures.clone(), medal.clone()],
+            thumbs.path(),
+            &fake,
+            |_| {},
+        );
+        std::fs::rename(&medal, base.path().join("unplugged")).unwrap();
+        let rep = scan(
+            &lib,
+            &[captures.clone(), medal.clone()],
+            thumbs.path(),
+            &fake,
+            |_| {},
+        );
+        assert_eq!(rep.removed, 0);
+        assert_eq!(count(), 3);
     }
 }

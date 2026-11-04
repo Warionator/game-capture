@@ -34,6 +34,8 @@ export interface CustomGame {
 
 export interface Settings {
   storageRoot: string;
+  /** Extra folders shown in the gallery (indexed read-only). */
+  extraLibraryFolders: string[];
   video: {
     resolution: Resolution;
     fps: number;

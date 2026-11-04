@@ -97,6 +97,28 @@ pub fn parse_file_name(name: &str) -> Option<(DateTime<Local>, Option<MediaKind>
     Some((when, kind))
 }
 
+fn normalized(p: &Path) -> String {
+    let mut s = p.to_string_lossy().replace('\\', "/");
+    // Windows paths are case-insensitive; drop the verbatim `\\?\` prefix.
+    if let Some(rest) = s.strip_prefix("//?/") {
+        s = rest.to_string();
+    }
+    while s.len() > 1 && s.ends_with('/') && !s.ends_with(":/") {
+        s.pop();
+    }
+    s.to_lowercase()
+}
+
+/// Whether `path` is `root` or lies inside it (case-insensitive, either
+/// slash direction, so it behaves like Windows path comparison).
+pub fn is_under(path: &Path, root: &Path) -> bool {
+    let (p, r) = (normalized(path), normalized(root));
+    if r.is_empty() {
+        return false;
+    }
+    p == r || (p.starts_with(&r) && (r.ends_with('/') || p[r.len()..].starts_with('/')))
+}
+
 /// Media kind implied by a file extension.
 pub fn kind_from_extension(path: &Path) -> Option<MediaKind> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
@@ -139,6 +161,19 @@ mod tests {
         assert_eq!(k, Some(MediaKind::Clip));
         assert!(parse_file_name("holiday.mp4").is_none());
         assert!(parse_file_name("ééééééééééééééééééééé.mp4").is_none());
+    }
+
+    #[test]
+    fn is_under_matches_windows_semantics() {
+        let p = Path::new(r"D:\Medal\Clips\Fortnite\a.mp4");
+        assert!(is_under(p, Path::new(r"D:\Medal")));
+        assert!(is_under(p, Path::new("d:/medal/")));
+        assert!(is_under(p, Path::new(r"\\?\D:\Medal")));
+        assert!(is_under(p, Path::new(r"D:\")));
+        assert!(!is_under(p, Path::new(r"D:\Med")));
+        assert!(!is_under(p, Path::new(r"D:\Captures")));
+        assert!(!is_under(p, Path::new("")));
+        assert!(is_under(Path::new("/a/b"), Path::new("/a/b")));
     }
 
     #[test]

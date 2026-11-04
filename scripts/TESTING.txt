@@ -1,0 +1,53 @@
+game-capture 0.1.0 - portable test build (Windows 10/11 x64)
+
+RUN
+  1. Extract the whole folder somewhere permanent (e.g. C:\Tools\game-capture).
+     Keep the "binaries" folder next to game-capture.exe - it holds FFmpeg.
+  2. Double-click game-capture.exe. Windows SmartScreen may warn because the
+     build is unsigned: "More info" -> "Run anyway".
+  3. WebView2 is preinstalled on Windows 10/11. If the window stays blank,
+     install the Evergreen runtime from microsoft.com/edge/webview2.
+
+WHAT THIS BUILD CHANGES ON YOUR PC (both on by default, per the spec)
+  - Disables Windows Game Mode for your user
+    (HKCU\Software\Microsoft\GameBar). Undo: Settings > System.
+  - Registers "start with Windows" pointing at THIS exe location
+    (HKCU\...\CurrentVersion\Run, value "game-capture").
+    Undo: Settings > System > Start with Windows (turn off before deleting
+    the folder).
+  Captures go to %USERPROFILE%\Videos\game-capture (change in Settings).
+
+SUGGESTED TEST PASS
+  [ ] Settings > Video: which encoders are listed as working (NVENC/AMF/QSV)?
+  [ ] Click "Capture desktop" in the top bar -> status shows encoder and
+      "zero-copy"; wait 30 s; Alt+F10 saves a clip; it appears in the gallery
+      and plays.
+  [ ] Start a game -> it is detected (name + icon in the top bar) and the
+      replay buffer starts by itself.
+  [ ] In game: Alt+F10 (clip), Alt+F9 (start/stop recording), Alt+F8
+      (bookmark), Alt+F12 (screenshot).
+  [ ] Open the clip in VLC/MPC: audio tracks 1 Master, 2 Game, 3 Mic,
+      4 Discord. Windows notification sounds should NOT be on the Game track.
+  [ ] Settings > Audio while capturing: level meters move; volume/mute act live.
+  [ ] Right-click a clip: Open file location / Copy to clipboard (paste in
+      Explorer or Discord) / Details / Delete.
+  [ ] Close the window -> app stays in the tray; tray menu Pause/Quit work.
+  [ ] Settings > General: change the library folder -> the gallery shows only
+      that folder. "Additional folders" > Add folder (e.g. D:\Medal) -> its
+      clips appear; remove it -> they disappear (files are left alone).
+  [ ] Delete the library database and restart -> gallery rebuilds from files:
+      %LOCALAPPDATA%\com.warionator.game-capture\library.sqlite
+
+IF SOMETHING FAILS
+  Log file: %LOCALAPPDATA%\com.warionator.game-capture\logs\game-capture.log
+  (it includes the exact FFmpeg command line and FFmpeg's error output).
+  Settings: %APPDATA%\com.warionator.game-capture\settings.json
+
+KNOWN LIMITS
+  - Games running as administrator need game-capture run as administrator
+    for hotkeys to work.
+  - Per-app audio needs Windows 10 2004 (build 19041) or newer.
+  - Built with the GNU toolchain for this test; the CI/installer build uses MSVC.
+
+FFmpeg 8.1 (GPL build from github.com/BtbN/FFmpeg-Builds) is included under
+its own licence - see binaries\FFMPEG-LICENSE.txt.
