@@ -13,8 +13,6 @@ members = [
 version = "1.0.0"
 edition = "2021"
 rust-version = "1.85"
-authors = ["Warionator"]
-repository = "https://github.com/Warionator/game-capture"
 
 [workspace.dependencies]
 gc-core = { path = "crates/gc-core" }

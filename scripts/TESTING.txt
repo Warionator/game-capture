@@ -78,12 +78,12 @@ SUGGESTED TEST PASS
       that folder. "Additional folders" > Add folder (e.g. D:\Medal) -> its
       clips appear; remove it -> they disappear (files are left alone).
   [ ] Delete the library database and restart -> gallery rebuilds from files:
-      %LOCALAPPDATA%\com.warionator.game-capture\library.sqlite
+      %LOCALAPPDATA%\GameCapture\library.sqlite
 
 IF SOMETHING FAILS
-  Log file: %LOCALAPPDATA%\com.warionator.game-capture\logs\game-capture.log
+  Log file: %LOCALAPPDATA%\GameCapture\logs\game-capture.log
   (it includes the exact FFmpeg command line and FFmpeg's error output).
-  Settings: %APPDATA%\com.warionator.game-capture\settings.json
+  Settings: %APPDATA%\GameCapture\settings.json
 
 KNOWN LIMITS
   - Games running as administrator need game-capture run as administrator

@@ -355,7 +355,7 @@ const handlers: Record<string, (a: Record<string, unknown>) => unknown> = {
     gameModeEnabled: false,
     autostartEnabled: true,
     ffmpegPath: "C:\\Program Files\\game-capture\\binaries\\ffmpeg.exe",
-    settingsPath: "C:\\Users\\me\\AppData\\Roaming\\com.warionator.game-capture\\settings.json",
+    settingsPath: "C:\\Users\\me\\AppData\\Roaming\\GameCapture\\settings.json",
     libraryItems: media.length,
     platform: "windows (mock)",
   }),
