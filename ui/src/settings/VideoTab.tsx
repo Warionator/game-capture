@@ -2,10 +2,9 @@ import { RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
-import type { Codec, EncoderInfo, EncoderPreference, MonitorInfo, RateControl, Resolution } from "../lib/types";
-import { Badge, Button, Field, Section, Select, Slider, Toggle } from "../components/ui";
-
-const mbps = (kbps: number) => `${(kbps / 1000).toFixed(kbps < 10_000 ? 1 : 0)} Mbps`;
+import type { CaptureMode, Codec, EncoderInfo, EncoderPreference, MonitorInfo } from "../lib/types";
+import { QualityFields } from "./QualityFields";
+import { Badge, Button, Field, Section, Select, Toggle } from "../components/ui";
 
 export function VideoTab() {
   const { settings, update, status } = useStore();
@@ -22,8 +21,6 @@ export function VideoTab() {
   const works = (b: EncoderPreference, c: Codec) =>
     b === "auto" ? encoders.some((e) => e.codec === c && e.working) : encoders.some((e) => e.backend === b && e.codec === c && e.working);
   const probed = encoders.length > 0;
-  const rc = v.rateControl;
-  const setRc = (r: RateControl) => update((x) => void (x.video.rateControl = r));
 
   const encoderOpts: { value: EncoderPreference; label: string }[] = [
     { value: "auto", label: "Automatic (best available)" },
@@ -87,94 +84,7 @@ export function VideoTab() {
       </Section>
 
       <Section title="Quality">
-        <Field label="Resolution" hint="Downscaling happens on the GPU when supported. Never upscales.">
-          <Select<Resolution>
-            label="Resolution"
-            value={v.resolution}
-            onChange={(val) => update((x) => void (x.video.resolution = val))}
-            options={[
-              { value: "native", label: "Source (native)" },
-              { value: "2160p", label: "4K (2160p)" },
-              { value: "1440p", label: "1440p" },
-              { value: "1080p", label: "1080p" },
-              { value: "720p", label: "720p" },
-            ]}
-          />
-        </Field>
-        <Field label="Frame rate">
-          <Select<number>
-            label="Frame rate"
-            value={v.fps}
-            onChange={(val) => update((x) => void (x.video.fps = val))}
-            options={[
-              { value: 30, label: "30 fps" },
-              { value: 60, label: "60 fps" },
-              { value: 120, label: "120 fps" },
-              { value: 144, label: "144 fps" },
-              { value: 0, label: "Source (uncapped)" },
-            ]}
-          />
-        </Field>
-        <Field label="Rate control" hint="CBR suits streaming-style uploads; VBR saves space; constant quality targets a visual level.">
-          <Select<RateControl["mode"]>
-            label="Rate control"
-            value={rc.mode}
-            onChange={(mode) => {
-              if (mode === "cbr") setRc({ mode, bitrateKbps: rc.mode === "quality" ? 25_000 : rc.bitrateKbps });
-              if (mode === "vbr") {
-                const b = rc.mode === "quality" ? 25_000 : rc.bitrateKbps;
-                setRc({ mode, bitrateKbps: b, maxKbps: Math.min(100_000, Math.round(b * 1.6)) });
-              }
-              if (mode === "quality") setRc({ mode, level: 21 });
-            }}
-            options={[
-              { value: "cbr", label: "CBR – constant bitrate" },
-              { value: "vbr", label: "VBR – variable bitrate" },
-              { value: "quality", label: "Constant quality (CQP / CRF)" },
-            ]}
-          />
-        </Field>
-        {rc.mode !== "quality" ? (
-          <>
-            <Field label={rc.mode === "vbr" ? "Target bitrate" : "Bitrate"} stacked>
-              <Slider
-                label="Bitrate"
-                min={1000}
-                max={100_000}
-                step={500}
-                value={rc.bitrateKbps}
-                format={mbps}
-                onChange={(b) =>
-                  setRc(rc.mode === "vbr" ? { ...rc, bitrateKbps: b, maxKbps: Math.max(rc.maxKbps, b) } : { mode: "cbr", bitrateKbps: b })
-                }
-              />
-            </Field>
-            {rc.mode === "vbr" && (
-              <Field label="Peak bitrate" stacked>
-                <Slider
-                  label="Peak bitrate"
-                  min={1000}
-                  max={100_000}
-                  step={500}
-                  value={rc.maxKbps}
-                  format={mbps}
-                  onChange={(m) => setRc({ ...rc, maxKbps: m, bitrateKbps: Math.min(rc.bitrateKbps, m) })}
-                />
-              </Field>
-            )}
-          </>
-        ) : (
-          <Field label="Quality level" hint="Lower is better quality and larger files. 18–23 is visually lossless for most games." stacked>
-            <Slider
-              label="Quality level"
-              min={10}
-              max={40}
-              value={rc.level}
-              format={(q) => `QP ${q}`}
-              onChange={(level) => setRc({ mode: "quality", level })}
-            />
-          </Field>
-        )}
+        <QualityFields />
         <Field label="Container" hint="MKV survives crashes mid-write; MP4 is the most compatible for sharing.">
           <Select
             label="Container"
@@ -189,6 +99,26 @@ export function VideoTab() {
       </Section>
 
       <Section title="Capture source">
+        <Field
+          label="Capture games by"
+          hint="Game window records only the game itself, so other apps and notifications never appear. Monitor records the whole screen the game is on."
+        >
+          <Select<CaptureMode>
+            label="Capture method"
+            value={v.captureMode}
+            onChange={(val) => update((x) => void (x.video.captureMode = val))}
+            options={[
+              { value: "window", label: "Game window (recommended)" },
+              { value: "monitor", label: "Entire monitor" },
+            ]}
+          />
+        </Field>
+        <Field
+          label="Show “Game not in focus” screen"
+          hint="While you're tabbed out of the game, the recording shows a placeholder screen instead of your desktop or other apps."
+        >
+          <Toggle label="Focus screen" checked={v.focusScreen} onChange={(b) => update((x) => void (x.video.focusScreen = b))} />
+        </Field>
         <Field label="Monitor" hint="Used when no game window is detected; games are captured on the monitor they run on.">
           <Select<number>
             label="Monitor"

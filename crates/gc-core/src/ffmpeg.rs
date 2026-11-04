@@ -170,8 +170,35 @@ pub enum VideoSource {
         /// output: `(x, y, w, h)` relative to the output.
         region: Option<(i32, i32, u32, u32)>,
     },
+    /// Windows Graphics Capture of a single window via `gfxcapture`
+    /// (FFmpeg ≥ 8). Only that window's pixels are captured, so overlapping
+    /// windows and notifications never appear. Output is scaled to
+    /// `source_size` if the window is resized.
+    Window {
+        hwnd: u64,
+        draw_mouse: bool,
+        adapter_idx: Option<u32>,
+    },
     /// Synthetic pattern; used by tests and on non-Windows development hosts.
     TestPattern,
+}
+
+impl VideoSource {
+    fn is_gpu(&self) -> bool {
+        matches!(
+            self,
+            VideoSource::Ddagrab { .. } | VideoSource::Window { .. }
+        )
+    }
+
+    fn adapter(&self) -> Option<u32> {
+        match self {
+            VideoSource::Ddagrab { adapter_idx, .. } | VideoSource::Window { adapter_idx, .. } => {
+                *adapter_idx
+            }
+            VideoSource::TestPattern => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,7 +206,8 @@ pub struct AudioInput {
     /// URL FFmpeg opens, e.g. `\\.\pipe\gc-1234-0`.
     pub url: String,
     pub in_mix: bool,
-    pub denoise: bool,
+    /// `afftdn` noise-reduction strength in dB.
+    pub denoise: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,6 +216,24 @@ pub enum Output {
     StdoutTs,
     /// Direct file output (format inferred from extension).
     File(String),
+}
+
+/// The "Game not in focus" picture shown instead of the capture while the
+/// game is in the background. Switched at runtime with [`focus_command`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct FocusScreen {
+    /// TTF for the caption (`drawtext`); `None` = no caption, plain screen.
+    pub font_file: Option<String>,
+}
+
+/// Background colour of the focus screen (matches the app UI).
+pub const FOCUS_SCREEN_COLOR: &str = "0x0b0d12";
+
+/// Bytes to write to FFmpeg's stdin to show (`true`) or hide the focus
+/// screen. Uses FFmpeg's interactive `c` command, which sends `map` to the
+/// `streamselect` filter in the running graph.
+pub fn focus_command(show_screen: bool) -> String {
+    format!("cstreamselect -1 map {}\n", u8::from(show_screen))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -203,10 +249,22 @@ pub struct PipelineSpec {
     /// Keep frames on the GPU between capture and encode.
     pub zero_copy: bool,
     pub gpu_scaler: Option<GpuScaler>,
+    /// `scale_d3d11` is available (needed to merge the focus screen into the
+    /// GPU path).
+    pub has_scale_d3d11: bool,
+    pub focus_screen: Option<FocusScreen>,
     pub audio: Vec<AudioInput>,
     pub mixdown: bool,
     pub audio_bitrate_kbps: u32,
     pub output: Output,
+}
+
+/// Escapes a value for use inside a single-quoted filter option.
+fn filter_quote(v: &str) -> String {
+    format!(
+        "'{}'",
+        v.replace('\\', "/").replace(':', "\\:").replace('\'', "")
+    )
 }
 
 impl PipelineSpec {
@@ -219,8 +277,9 @@ impl PipelineSpec {
     pub fn is_zero_copy(&self) -> bool {
         self.zero_copy
             && self.backend.is_hardware()
-            && matches!(self.video, VideoSource::Ddagrab { .. })
-            && (!self.needs_scale() || self.gpu_scaler.is_some())
+            && self.video.is_gpu()
+            && (!self.needs_scale() || self.gpu_scaler.is_some() || self.focus_screen.is_some())
+            && (self.focus_screen.is_none() || self.has_scale_d3d11)
     }
 
     fn needs_scale(&self) -> bool {
@@ -230,41 +289,48 @@ impl PipelineSpec {
 
     fn capture_rate(&self) -> u32 {
         if self.fps.is_uncapped() {
-            // ddagrab treats framerate as an upper bound when dup_frames=0.
+            // ddagrab/gfxcapture treat the rate as an upper bound when
+            // frame duplication is off.
             500
         } else {
             self.fps.0
         }
     }
 
-    /// Video filter chain applied after the capture source, or `None`.
-    fn video_filter(&self) -> Option<String> {
+    /// GPU-side chain after the capture (and focus switch) for the encoder.
+    fn gpu_tail(&self, normalize: bool) -> Option<String> {
         let (ow, oh) = self.output_size();
         let scale = self.needs_scale();
-        if self.is_zero_copy() {
-            return match (self.backend, scale) {
-                // NVENC and AMF accept D3D11 textures directly.
-                (Backend::Nvenc | Backend::Amf, false) => None,
-                (Backend::Qsv, false) => Some("hwmap=derive_device=qsv,format=qsv".into()),
-                (Backend::Software, _) => unreachable!("is_zero_copy excludes software"),
-                (_, true) => Some(match (self.backend, self.gpu_scaler.expect("checked by is_zero_copy")) {
+        let d3d11 = format!("scale_d3d11=width={ow}:height={oh}:format=nv12");
+        match (self.backend, scale, normalize) {
+            // Mixing two frame sources: always re-render into one D3D11 pool.
+            (Backend::Qsv, _, true) => Some(format!("{d3d11},hwmap=derive_device=qsv,format=qsv")),
+            (_, _, true) => Some(d3d11),
+            // NVENC and AMF accept D3D11 textures directly.
+            (Backend::Nvenc | Backend::Amf, false, false) => None,
+            (Backend::Qsv, false, false) => Some("hwmap=derive_device=qsv,format=qsv".into()),
+            (Backend::Software, _, _) => unreachable!("is_zero_copy excludes software"),
+            (_, true, false) => Some(
+                match (
+                    self.backend,
+                    self.gpu_scaler.expect("checked by is_zero_copy"),
+                ) {
                     (Backend::Amf, GpuScaler::Amf) => format!("vpp_amf=w={ow}:h={oh}:format=nv12"),
                     (Backend::Qsv, GpuScaler::Qsv) => {
                         format!("hwmap=derive_device=qsv,format=qsv,scale_qsv=w={ow}:h={oh}:format=nv12")
                     }
-                    (Backend::Qsv, _) => format!(
-                        "scale_d3d11=width={ow}:height={oh}:format=nv12,hwmap=derive_device=qsv,format=qsv"
-                    ),
-                    _ => format!("scale_d3d11=width={ow}:height={oh}:format=nv12"),
-                }),
-            };
+                    (Backend::Qsv, _) => format!("{d3d11},hwmap=derive_device=qsv,format=qsv"),
+                    _ => d3d11,
+                },
+            ),
         }
+    }
+
+    /// CPU-side chain (scaling + pixel format for the encoder).
+    fn cpu_tail(&self) -> String {
+        let (ow, oh) = self.output_size();
         let mut chain = Vec::new();
-        if matches!(self.video, VideoSource::Ddagrab { .. }) {
-            chain.push("hwdownload".to_string());
-            chain.push("format=bgra".to_string());
-        }
-        if scale {
+        if self.needs_scale() {
             chain.push(format!("scale={ow}:{oh}:flags=bicubic"));
         }
         chain.push(
@@ -275,7 +341,61 @@ impl PipelineSpec {
             }
             .to_string(),
         );
-        Some(chain.join(","))
+        chain.join(",")
+    }
+
+    /// The focus-screen source, sized like the capture.
+    fn focus_source(&self, f: &FocusScreen, upload: bool) -> String {
+        let (w, h) = self.source_size;
+        let mut src = format!("color=c={FOCUS_SCREEN_COLOR}:s={w}x{h}:r=1");
+        if let Some(font) = &f.font_file {
+            let font = filter_quote(font);
+            let big = (h / 16).max(16);
+            let small = (h / 36).max(10);
+            src.push_str(&format!(
+                ",drawtext=fontfile={font}:text='Game not in focus':fontcolor=0xe6e9ef:fontsize={big}:x=(w-text_w)/2:y=(h/2)-text_h",
+            ));
+            src.push_str(&format!(
+                ",drawtext=fontfile={font}:text='Capture resumes when you return to the game':fontcolor=0x9aa3b5:fontsize={small}:x=(w-text_w)/2:y=(h/2)+{small}",
+            ));
+        }
+        src.push_str(",format=bgra");
+        if upload {
+            src.push_str(",hwupload");
+        }
+        src
+    }
+
+    /// Complete video part of the filter graph, ending in `[v]`.
+    fn video_graph(&self, src: &str) -> String {
+        let zero_copy = self.is_zero_copy();
+        let fps = if self.fps.is_uncapped() {
+            String::new()
+        } else {
+            format!(",fps={}", self.fps.0)
+        };
+        let download = if self.video.is_gpu() {
+            ",hwdownload,format=bgra"
+        } else {
+            ""
+        };
+        match &self.focus_screen {
+            None if zero_copy => match self.gpu_tail(false) {
+                Some(t) => format!("{src},{t}[v]"),
+                None => format!("{src}[v]"),
+            },
+            None => format!("{src}{download},{}[v]", self.cpu_tail()),
+            Some(f) if zero_copy => format!(
+                "{src}[cap];{}[fs];[cap][fs]streamselect=inputs=2:map=0{fps},{}[v]",
+                self.focus_source(f, true),
+                self.gpu_tail(true).expect("normalized tail")
+            ),
+            Some(f) => format!(
+                "{src}{download}[cap];{}[fs];[cap][fs]streamselect=inputs=2:map=0{fps},{}[v]",
+                self.focus_source(f, false),
+                self.cpu_tail()
+            ),
+        }
     }
 
     /// Full argument vector (without the program name).
@@ -288,22 +408,30 @@ impl PipelineSpec {
             &["-hide_banner", "-loglevel", "warning", "-nostats"],
         );
 
+        // A shared D3D11 device: needed to pick an adapter, and so the focus
+        // screen is uploaded to the same device the capture uses.
+        let needs_device =
+            self.video.adapter().is_some() || (self.focus_screen.is_some() && self.is_zero_copy());
+        if needs_device {
+            let dev = match self.video.adapter() {
+                Some(adapter) => format!("d3d11va=gc:{adapter}"),
+                None => "d3d11va=gc".to_string(),
+            };
+            push(
+                &mut a,
+                &["-init_hw_device", &dev, "-filter_hw_device", "gc"],
+            );
+        }
+
         // --- video source (a filter-graph source, not an input file) ------
         let rate = self.capture_rate();
         let video_src = match &self.video {
             VideoSource::Ddagrab {
-                adapter_idx,
                 output_idx,
                 draw_mouse,
                 region,
+                ..
             } => {
-                if let Some(adapter) = adapter_idx {
-                    let dev = format!("d3d11va=gc:{adapter}");
-                    push(
-                        &mut a,
-                        &["-init_hw_device", &dev, "-filter_hw_device", "gc"],
-                    );
-                }
                 let mut src = format!(
                     "ddagrab=output_idx={output_idx}:framerate={rate}:draw_mouse={}",
                     u8::from(*draw_mouse)
@@ -315,6 +443,16 @@ impl PipelineSpec {
                     src.push_str(":dup_frames=0");
                 }
                 src
+            }
+            VideoSource::Window {
+                hwnd, draw_mouse, ..
+            } => {
+                let (w, h) = self.source_size;
+                format!(
+                    "gfxcapture=hwnd={hwnd}:max_framerate={rate}:capture_cursor={}:width={w}:height={h}:resize_mode=scale_aspect:dup_frames={}",
+                    u8::from(*draw_mouse),
+                    u8::from(!self.fps.is_uncapped())
+                )
             }
             VideoSource::TestPattern => {
                 let (w, h) = self.source_size;
@@ -346,11 +484,7 @@ impl PipelineSpec {
         }
 
         // --- filter graph --------------------------------------------------
-        let mut graph: Vec<String> = Vec::new();
-        graph.push(match self.video_filter() {
-            Some(f) => format!("{video_src},{f}[v]"),
-            None => format!("{video_src}[v]"),
-        });
+        let mut graph: Vec<String> = vec![self.video_graph(&video_src)];
         let video_map = "[v]".to_string();
 
         let mix_members: Vec<usize> = (0..self.audio.len())
@@ -362,8 +496,8 @@ impl PipelineSpec {
         for (i, input) in self.audio.iter().enumerate() {
             let idx = i;
             let mut label = format!("{idx}:a");
-            if input.denoise {
-                graph.push(format!("[{idx}:a]afftdn=nf=-25[dn{idx}]"));
+            if let Some(nr) = input.denoise {
+                graph.push(format!("[{idx}:a]afftdn=nr={nr}:nf=-40[dn{idx}]"));
                 label = format!("dn{idx}");
             }
             if do_mix && input.in_mix {
@@ -658,6 +792,171 @@ pub fn remux_args(input: &str, output: &Path, spec: &RemuxSpec) -> Vec<String> {
     a
 }
 
+/// Gain applied to one audio stream of a clip being edited.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackGain {
+    /// Audio stream index within the file (0 = first audio track).
+    pub index: usize,
+    pub volume: f32,
+    pub muted: bool,
+}
+
+impl TrackGain {
+    pub fn gain(&self) -> f32 {
+        if self.muted {
+            0.0
+        } else {
+            self.volume.clamp(0.0, 2.0)
+        }
+    }
+}
+
+/// A trim/volume edit of an existing file.
+#[derive(Debug, Clone, Default)]
+pub struct ExportSpec {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    /// Number of audio streams in the input.
+    pub audio_streams: usize,
+    /// Track gains to bake in. `None` = audio is copied untouched.
+    pub gains: Option<Vec<TrackGain>>,
+    /// The first audio stream is a mix of the others (game-capture layout);
+    /// it is rebuilt from the adjusted tracks.
+    pub rebuild_master: bool,
+    pub tags: Vec<(String, String)>,
+    pub audio_titles: Vec<String>,
+    pub chapters_file: Option<String>,
+    pub audio_bitrate_kbps: u32,
+}
+
+/// `ffmpeg` arguments that trim `input` to `[start, end)` and optionally
+/// re-mix its audio tracks. Video is always stream-copied (lossless, fast);
+/// the cut therefore starts on the keyframe at or before `start`.
+pub fn export_args(input: &Path, output: &Path, spec: &ExportSpec) -> Vec<String> {
+    let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-y"]
+        .map(String::from)
+        .to_vec();
+    if spec.start_ms > 0 {
+        a.extend([
+            "-ss".to_string(),
+            format!("{:.3}", spec.start_ms as f64 / 1000.0),
+        ]);
+    }
+    a.extend(["-i".to_string(), input.to_string_lossy().into_owned()]);
+    if let Some(ch) = &spec.chapters_file {
+        a.extend(["-f", "ffmetadata", "-i"].map(String::from));
+        a.push(ch.clone());
+    }
+    let dur = spec.end_ms.saturating_sub(spec.start_ms).max(100);
+    a.extend(["-t".to_string(), format!("{:.3}", dur as f64 / 1000.0)]);
+
+    a.extend(["-map", "0:v?"].map(String::from));
+    match &spec.gains {
+        None => {
+            a.extend(["-map", "0:a?", "-c", "copy"].map(String::from));
+        }
+        Some(gains) => {
+            let gain_of = |i: usize| {
+                gains
+                    .iter()
+                    .find(|g| g.index == i)
+                    .map(|g| g.gain())
+                    .unwrap_or(1.0)
+            };
+            let first = usize::from(spec.rebuild_master && spec.audio_streams > 1);
+            let isolated: Vec<usize> = (first..spec.audio_streams).collect();
+            let mut graph = Vec::new();
+            let mut maps = Vec::new();
+            let mut mix_in = Vec::new();
+            for &i in &isolated {
+                let g = gain_of(i);
+                if first == 1 {
+                    graph.push(format!("[0:a:{i}]volume={g:.3},asplit=2[t{i}][m{i}]"));
+                    mix_in.push(format!("[m{i}]"));
+                } else {
+                    graph.push(format!("[0:a:{i}]volume={g:.3}[t{i}]"));
+                }
+                maps.push(format!("[t{i}]"));
+            }
+            if first == 1 {
+                graph.push(format!(
+                    "{}amix=inputs={}:normalize=0:dropout_transition=0,alimiter=limit=0.97:level=0[mix]",
+                    mix_in.join(""),
+                    mix_in.len()
+                ));
+                maps.insert(0, "[mix]".into());
+            }
+            a.extend(["-filter_complex".to_string(), graph.join(";")]);
+            for m in maps {
+                a.extend(["-map".to_string(), m]);
+            }
+            a.extend(["-c:v", "copy", "-c:a", "aac"].map(String::from));
+            a.extend(["-b:a".to_string(), format!("{}k", spec.audio_bitrate_kbps)]);
+        }
+    }
+    a.extend(["-map_metadata", "0"].map(String::from));
+    if spec.chapters_file.is_some() {
+        a.extend(["-map_chapters", "1"].map(String::from));
+    } else {
+        a.extend(["-map_chapters", "-1"].map(String::from));
+    }
+    for (k, v) in &spec.tags {
+        a.push("-metadata".into());
+        a.push(format!("{k}={v}"));
+    }
+    for (i, t) in spec.audio_titles.iter().enumerate() {
+        a.push(format!("-metadata:s:a:{i}"));
+        a.push(format!("title={t}"));
+        a.push(format!("-metadata:s:a:{i}"));
+        a.push(format!("handler_name={t}"));
+        a.push(format!("-disposition:a:{i}"));
+        a.push(if i == 0 { "default" } else { "0" }.into());
+    }
+    let ext = output
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp4")
+        .to_ascii_lowercase();
+    if ext == "mkv" {
+        a.extend(["-f", "matroska"].map(String::from));
+    } else {
+        a.extend(["-movflags", "+faststart+use_metadata_tags", "-f", "mp4"].map(String::from));
+    }
+    a.push(output.to_string_lossy().into_owned());
+    a
+}
+
+/// `ffmpeg` arguments extracting audio streams into separate `.m4a` files
+/// (for per-track playback in the built-in player). `copy = false`
+/// re-encodes to AAC for codecs MP4 audio cannot hold.
+pub fn extract_tracks_args(
+    input: &Path,
+    outputs: &[(usize, std::path::PathBuf)],
+    copy: bool,
+) -> Vec<String> {
+    let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-y", "-i"]
+        .map(String::from)
+        .to_vec();
+    a.push(input.to_string_lossy().into_owned());
+    for (i, out) in outputs {
+        a.extend([
+            "-map".to_string(),
+            format!("0:a:{i}"),
+            "-vn".into(),
+            "-sn".into(),
+        ]);
+        if copy {
+            a.extend(["-c:a", "copy"].map(String::from));
+        } else {
+            a.extend(["-c:a", "aac", "-b:a", "192k"].map(String::from));
+        }
+        a.extend(["-movflags", "+faststart", "-f", "mp4"].map(String::from));
+        a.push(out.to_string_lossy().into_owned());
+    }
+    a
+}
+
 /// `ffmpeg` arguments to render a JPEG thumbnail.
 pub fn thumbnail_args(input: &Path, output: &Path, at_secs: f64, is_image: bool) -> Vec<String> {
     let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-y"]
@@ -815,21 +1114,23 @@ mod tests {
             },
             zero_copy: true,
             gpu_scaler: None,
+            has_scale_d3d11: false,
+            focus_screen: None,
             audio: vec![
                 AudioInput {
                     url: r"\\.\pipe\gc-1-0".into(),
                     in_mix: true,
-                    denoise: false,
+                    denoise: None,
                 },
                 AudioInput {
                     url: r"\\.\pipe\gc-1-1".into(),
                     in_mix: true,
-                    denoise: true,
+                    denoise: Some(12),
                 },
                 AudioInput {
                     url: r"\\.\pipe\gc-1-2".into(),
                     in_mix: false,
-                    denoise: false,
+                    denoise: None,
                 },
             ],
             mixdown: true,
@@ -856,7 +1157,7 @@ mod tests {
             fc.starts_with("ddagrab=output_idx=0:framerate=60:draw_mouse=0[v];"),
             "no video filter expected: {fc}"
         );
-        assert!(fc.contains("[1:a]afftdn=nf=-25[dn1]"));
+        assert!(fc.contains("[1:a]afftdn=nr=12:nf=-40[dn1]"));
         assert!(fc.contains("[mx0][mx1]amix=inputs=2"));
         let maps: Vec<_> = a
             .iter()
@@ -947,6 +1248,96 @@ mod tests {
         assert!(arg_after(&a, "-filter_complex").unwrap().starts_with(
             "ddagrab=output_idx=1:framerate=60:draw_mouse=1:video_size=1280x720:offset_x=100:offset_y=50[v]"
         ));
+    }
+
+    #[test]
+    fn window_capture_with_focus_screen_zero_copy() {
+        let mut s = spec();
+        s.video = VideoSource::Window {
+            hwnd: 0x1234,
+            draw_mouse: false,
+            adapter_idx: None,
+        };
+        s.source_size = (1920, 1080);
+        s.focus_screen = Some(FocusScreen {
+            font_file: Some(r"C:\Windows\Fonts\segoeui.ttf".into()),
+        });
+        // Without scale_d3d11 the two frame sources cannot share the GPU path.
+        assert!(!s.is_zero_copy());
+        s.has_scale_d3d11 = true;
+        assert!(s.is_zero_copy());
+        let a = s.build_args();
+        assert_eq!(arg_after(&a, "-init_hw_device"), Some("d3d11va=gc"));
+        let fc = arg_after(&a, "-filter_complex").unwrap();
+        assert!(fc.starts_with(
+            "gfxcapture=hwnd=4660:max_framerate=60:capture_cursor=0:width=1920:height=1080:resize_mode=scale_aspect:dup_frames=1[cap];"
+        ), "{fc}");
+        assert!(fc.contains("color=c=0x0b0d12:s=1920x1080:r=1,drawtext=fontfile='C\\:/Windows/Fonts/segoeui.ttf'"), "{fc}");
+        assert!(fc.contains(",format=bgra,hwupload[fs];"), "{fc}");
+        assert!(fc.contains("[cap][fs]streamselect=inputs=2:map=0,fps=60,scale_d3d11=width=1920:height=1080:format=nv12[v]"), "{fc}");
+        assert_eq!(focus_command(true), "cstreamselect -1 map 1\n");
+    }
+
+    #[test]
+    fn focus_screen_download_path() {
+        let mut s = spec();
+        s.backend = Backend::Software;
+        s.resolution = Resolution::P1080;
+        s.focus_screen = Some(FocusScreen { font_file: None });
+        let a = s.build_args();
+        assert!(!a.iter().any(|x| x == "-init_hw_device"));
+        let fc = arg_after(&a, "-filter_complex").unwrap();
+        assert!(fc.starts_with(
+            "ddagrab=output_idx=0:framerate=60:draw_mouse=0,hwdownload,format=bgra[cap];color=c=0x0b0d12:s=2560x1440:r=1,format=bgra[fs];[cap][fs]streamselect=inputs=2:map=0,fps=60,scale=1920:1080:flags=bicubic,format=yuv420p[v]"
+        ), "{fc}");
+    }
+
+    #[test]
+    fn export_trim_copy_and_remix() {
+        let mut spec = ExportSpec {
+            start_ms: 2_500,
+            end_ms: 10_000,
+            audio_streams: 4,
+            audio_bitrate_kbps: 160,
+            ..Default::default()
+        };
+        let a = export_args(Path::new("in.mp4"), Path::new("out.mp4"), &spec);
+        assert_eq!(arg_after(&a, "-ss"), Some("2.500"));
+        assert_eq!(arg_after(&a, "-t"), Some("7.500"));
+        assert!(a.windows(2).any(|w| w == ["-c", "copy"]));
+        assert_eq!(arg_after(&a, "-map_chapters"), Some("-1"));
+
+        spec.rebuild_master = true;
+        spec.gains = Some(vec![TrackGain {
+            index: 2,
+            volume: 1.0,
+            muted: true,
+        }]);
+        let a = export_args(Path::new("in.mp4"), Path::new("out.mkv"), &spec);
+        let fc = arg_after(&a, "-filter_complex").unwrap();
+        assert!(fc.contains("[0:a:1]volume=1.000,asplit=2[t1][m1]"));
+        assert!(fc.contains("[0:a:2]volume=0.000,asplit=2[t2][m2]"));
+        assert!(fc.contains("[m1][m2][m3]amix=inputs=3"));
+        let maps: Vec<_> = a
+            .windows(2)
+            .filter(|w| w[0] == "-map")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(maps, ["0:v?", "[mix]", "[t1]", "[t2]", "[t3]"]);
+        assert!(a.windows(2).any(|w| w == ["-c:v", "copy"]));
+        assert!(a.windows(2).any(|w| w == ["-f", "matroska"]));
+
+        let x = extract_tracks_args(
+            Path::new("in.mkv"),
+            &[(1, "a1.m4a".into()), (2, "a2.m4a".into())],
+            true,
+        );
+        let maps: Vec<_> = x
+            .windows(2)
+            .filter(|w| w[0] == "-map")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(maps, ["0:a:1", "0:a:2"]);
     }
 
     #[test]

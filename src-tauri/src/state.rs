@@ -21,6 +21,9 @@ pub struct AppState {
     pub settings_path: PathBuf,
     pub library: Arc<Mutex<Library>>,
     pub thumbs_dir: PathBuf,
+    /// Per-track audio extracted for the built-in player.
+    pub track_cache: PathBuf,
+    pub temp_dir: PathBuf,
     pub engine: Mutex<Option<CaptureEngine>>,
     pub watcher: Mutex<Option<ProcessWatcher>>,
     pub game_cfg: Arc<RwLock<GameSettings>>,
@@ -80,8 +83,11 @@ pub fn init(app: &AppHandle, minimized: bool) -> anyhow::Result<()> {
     let library = Arc::new(Mutex::new(Library::open(&data_dir.join("library.sqlite"))?));
     let thumbs_dir = data_dir.join("thumbnails");
     let temp_dir = data_dir.join("temp");
+    let track_cache = data_dir.join("track-cache");
     std::fs::create_dir_all(&thumbs_dir)?;
     std::fs::create_dir_all(&temp_dir)?;
+    std::fs::create_dir_all(&track_cache)?;
+    gc_capture::edit::prune_track_cache(&track_cache, std::time::Duration::from_secs(3 * 86_400));
 
     let ffmpeg = match Ffmpeg::locate(&ffmpeg_search_dirs(app)) {
         Ok(f) => {
@@ -101,13 +107,19 @@ pub fn init(app: &AppHandle, minimized: bool) -> anyhow::Result<()> {
     });
 
     allow_asset_dirs(app, &settings.library_roots(), &thumbs_dir);
+    if let Err(e) = app
+        .asset_protocol_scope()
+        .allow_directory(&track_cache, true)
+    {
+        log::warn!("asset scope for track cache: {e}");
+    }
 
     // --- capture engine --------------------------------------------------
     let (ev_tx, ev_rx) = unbounded::<EngineEvent>();
     let engine = CaptureEngine::new(
         EnginePaths {
             ffmpeg: ffmpeg.clone(),
-            temp_dir,
+            temp_dir: temp_dir.clone(),
         },
         settings.clone(),
         ev_tx,
@@ -122,6 +134,8 @@ pub fn init(app: &AppHandle, minimized: bool) -> anyhow::Result<()> {
         settings_path,
         library,
         thumbs_dir,
+        track_cache,
+        temp_dir,
         engine: Mutex::new(Some(engine)),
         watcher: Mutex::new(None),
         game_cfg: game_cfg.clone(),

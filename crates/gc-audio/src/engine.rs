@@ -1,4 +1,4 @@
-use crate::buffer::{apply_gain, peak, SampleRing, TrackControl};
+use crate::buffer::{apply_gain, peak, NoiseGate, SampleRing, TrackControl};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use gc_core::config::TrackKind;
 use gc_core::ffmpeg::{CHANNELS, SAMPLE_RATE};
@@ -96,6 +96,8 @@ pub struct EngineTrack {
     pub kind: TrackKind,
     pub volume: f32,
     pub muted: bool,
+    /// Noise-gate threshold in dBFS (`None` = no gate).
+    pub gate_db: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +110,8 @@ pub struct TrackLevel {
     pub muted: bool,
     /// Number of live capture sources feeding the track.
     pub sources: usize,
+    /// Noise gate state: `None` when the track has no gate.
+    pub gate_open: Option<bool>,
 }
 
 struct Source {
@@ -159,8 +163,10 @@ impl AudioEngine {
                 .into_iter()
                 .filter(|t| t.kind != TrackKind::Mix)
                 .map(|t| {
+                    let control = TrackControl::new(t.volume, t.muted);
+                    control.set_gate_db(t.gate_db);
                     Arc::new(TrackState {
-                        control: TrackControl::new(t.volume, t.muted),
+                        control,
                         title: t.title,
                         kind: t.kind,
                         sources: Mutex::new(Vec::new()),
@@ -247,6 +253,15 @@ impl AudioEngine {
         }
     }
 
+    /// Live noise-gate change by track title.
+    pub fn set_gate_by_title(&self, title: &str, gate_db: Option<f32>) {
+        for t in &self.shared.tracks {
+            if t.title == title {
+                t.control.set_gate_db(gate_db);
+            }
+        }
+    }
+
     pub fn set_game_pid(&self, pid: Option<u32>) {
         *self.shared.game_pid.lock() = pid;
         self.shared.resolve_now.store(true, Ordering::SeqCst);
@@ -267,6 +282,7 @@ impl AudioEngine {
                     .iter()
                     .filter(|s| s.handle.is_alive())
                     .count(),
+                gate_open: (t.control.gate_threshold() > 0.0).then(|| t.control.gate_open()),
             })
             .collect()
     }
@@ -350,6 +366,7 @@ fn pump(shared: Arc<Shared>, senders: Vec<Option<Sender<Vec<f32>>>>) {
     let start = Instant::now();
     let mut frames_sent: u64 = 0;
     let prime = samples_for_ms(PRIME_MS);
+    let mut gates = vec![NoiseGate::default(); shared.tracks.len()];
     while !shared.stop.load(Ordering::SeqCst) {
         std::thread::sleep(TICK);
         let due_total = (start.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as u64;
@@ -376,7 +393,11 @@ fn pump(shared: Arc<Shared>, senders: Vec<Option<Sender<Vec<f32>>>>) {
                 }
             }
             apply_gain(&mut block, track.control.gain());
+            // The meter shows the level *before* the gate, so the threshold
+            // can be set by watching it.
             track.control.update_peak(peak(&block));
+            let open = gates[i].process(&mut block, track.control.gate_threshold());
+            track.control.set_gate_open(open);
             if let Some(Some(tx)) = senders.get(i) {
                 match tx.try_send(block) {
                     Ok(()) | Err(TrySendError::Full(_)) => {}
@@ -503,12 +524,14 @@ mod tests {
                 kind: TrackKind::Game,
                 volume: 1.0,
                 muted: false,
+                gate_db: None,
             },
             EngineTrack {
                 title: "Microphone".into(),
                 kind: TrackKind::Mic,
                 volume: 2.0,
                 muted: false,
+                gate_db: None,
             },
         ];
         let paths: Vec<_> = (0..2).map(|i| dir.join(format!("t{i}.f32"))).collect();

@@ -64,6 +64,11 @@ pub fn window_placement(_hwnd: isize) -> Option<WindowPlacement> {
     None
 }
 
+#[cfg(not(windows))]
+pub fn window_client_size(_hwnd: isize) -> Option<(u32, u32)> {
+    None
+}
+
 #[cfg(windows)]
 mod imp {
     use super::*;
@@ -71,7 +76,16 @@ mod imp {
     use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
     use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
-    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect};
+
+    /// Size of a window's client area (what Windows Graphics Capture
+    /// records, without borders and title bar).
+    pub fn window_client_size(hwnd: isize) -> Option<(u32, u32)> {
+        let mut r = RECT::default();
+        unsafe { GetClientRect(HWND(hwnd as *mut _), &mut r).ok()? };
+        let (w, h) = ((r.right - r.left) as u32, (r.bottom - r.top) as u32);
+        (w >= 16 && h >= 16).then_some((w, h))
+    }
 
     pub fn list_monitors() -> Vec<MonitorInfo> {
         let mut out = Vec::new();

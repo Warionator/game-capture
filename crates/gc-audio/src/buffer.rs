@@ -70,6 +70,9 @@ pub struct TrackControl {
     volume_bits: AtomicU32,
     muted: AtomicBool,
     peak_bits: AtomicU32,
+    /// Noise-gate threshold (linear amplitude); 0 = gate off.
+    gate_bits: AtomicU32,
+    gate_open: AtomicBool,
 }
 
 impl TrackControl {
@@ -78,7 +81,26 @@ impl TrackControl {
             volume_bits: AtomicU32::new(volume.to_bits()),
             muted: AtomicBool::new(muted),
             peak_bits: AtomicU32::new(0f32.to_bits()),
+            gate_bits: AtomicU32::new(0f32.to_bits()),
+            gate_open: AtomicBool::new(true),
         })
+    }
+    /// Sets the noise-gate threshold in dBFS, `None` to disable the gate.
+    pub fn set_gate_db(&self, db: Option<f32>) {
+        let lin = db
+            .map(|d| 10f32.powf(d.clamp(-100.0, 0.0) / 20.0))
+            .unwrap_or(0.0);
+        self.gate_bits.store(lin.to_bits(), Ordering::Relaxed);
+    }
+    /// Gate threshold as linear amplitude (0 = off).
+    pub fn gate_threshold(&self) -> f32 {
+        f32::from_bits(self.gate_bits.load(Ordering::Relaxed))
+    }
+    pub fn gate_open(&self) -> bool {
+        self.gate_open.load(Ordering::Relaxed)
+    }
+    pub fn set_gate_open(&self, open: bool) {
+        self.gate_open.store(open, Ordering::Relaxed);
     }
     pub fn volume(&self) -> f32 {
         f32::from_bits(self.volume_bits.load(Ordering::Relaxed))
@@ -115,6 +137,72 @@ impl TrackControl {
     }
 }
 
+/// Downward noise gate with hold and smoothed gain (no clicks).
+#[derive(Debug, Clone)]
+pub struct NoiseGate {
+    env: f32,
+    gain: f32,
+    hold_left: u32,
+}
+
+impl Default for NoiseGate {
+    fn default() -> Self {
+        Self {
+            env: 0.0,
+            gain: 1.0,
+            hold_left: 0,
+        }
+    }
+}
+
+impl NoiseGate {
+    const RATE: f32 = 48_000.0;
+    /// Envelope release (~50 ms), gate hold (150 ms), gain attack (2 ms)
+    /// and gain release (80 ms).
+    const ENV_RELEASE_S: f32 = 0.05;
+    const HOLD_S: f32 = 0.15;
+    const ATTACK_S: f32 = 0.002;
+    const RELEASE_S: f32 = 0.08;
+
+    /// Gates interleaved stereo `samples` in place. Returns whether the gate
+    /// is open at the end of the block. `threshold` is linear; 0 bypasses.
+    pub fn process(&mut self, samples: &mut [f32], threshold: f32) -> bool {
+        if threshold <= 0.0 {
+            self.gain = 1.0;
+            return true;
+        }
+        let env_coef = (-1.0 / (Self::ENV_RELEASE_S * Self::RATE)).exp();
+        let up = 1.0 / (Self::ATTACK_S * Self::RATE);
+        let down = 1.0 / (Self::RELEASE_S * Self::RATE);
+        let hold = (Self::HOLD_S * Self::RATE) as u32;
+        for frame in samples.chunks_exact_mut(2) {
+            let level = frame[0].abs().max(frame[1].abs());
+            self.env = if level > self.env {
+                level
+            } else {
+                self.env * env_coef
+            };
+            let open = if self.env >= threshold {
+                self.hold_left = hold;
+                true
+            } else if self.hold_left > 0 {
+                self.hold_left -= 1;
+                true
+            } else {
+                false
+            };
+            self.gain = if open {
+                (self.gain + up).min(1.0)
+            } else {
+                (self.gain - down).max(0.0)
+            };
+            frame[0] *= self.gain;
+            frame[1] *= self.gain;
+        }
+        self.hold_left > 0 || self.env >= threshold
+    }
+}
+
 /// Multiplies in place and hard-clips to [-1, 1].
 pub fn apply_gain(samples: &mut [f32], gain: f32) {
     if (gain - 1.0).abs() < f32::EPSILON {
@@ -145,6 +233,30 @@ mod tests {
         assert_eq!(r.mix_into(&mut out), 6);
         assert_eq!(out, [2.5, 2.5, 3.5, 3.5, 4.5, 4.5, 0.5, 0.5]);
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn noise_gate_silences_quiet_signal() {
+        let c = TrackControl::new(1.0, false);
+        c.set_gate_db(Some(-30.0)); // ≈ 0.0316
+        let thr = c.gate_threshold();
+        assert!((thr - 0.0316).abs() < 0.001);
+        let mut g = NoiseGate::default();
+        // 0.5 s of quiet hiss (-40 dBFS) → gate closes, output fades to 0.
+        let mut quiet = vec![0.01f32; 48_000];
+        let open = g.process(&mut quiet, thr);
+        assert!(!open);
+        assert!(quiet[quiet.len() - 2].abs() < 1e-6);
+        // Speech (-12 dBFS) opens it again within a couple of ms.
+        let mut loud = vec![0.25f32; 4_800];
+        assert!(g.process(&mut loud, thr));
+        assert!((loud[loud.len() - 2] - 0.25).abs() < 1e-6);
+        // Threshold 0 bypasses.
+        let mut x = vec![0.001f32; 10];
+        assert!(g.process(&mut x, 0.0));
+        assert_eq!(x[0], 0.001);
+        c.set_gate_db(None);
+        assert_eq!(c.gate_threshold(), 0.0);
     }
 
     #[test]

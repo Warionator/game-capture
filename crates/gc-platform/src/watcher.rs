@@ -3,7 +3,8 @@
 //! Every couple of seconds the watcher takes a cheap process snapshot. Only
 //! the foreground process and processes matching user-registered games are
 //! inspected in depth (module list, version info, fullscreen state), so the
-//! idle cost stays negligible. Once a game is detected it stays active until
+//! idle cost stays negligible. Auto-detected games must qualify on two
+//! consecutive polls; user-registered games are picked up immediately. Once a game is detected it stays active until
 //! its process exits, even if the user alt-tabs.
 
 use crate::process::{self, ProcessEntry};
@@ -94,6 +95,10 @@ fn run(
     current: Arc<RwLock<Option<DetectedGame>>>,
 ) {
     let mut rejected: HashMap<u32, Instant> = HashMap::new();
+    // A process that looked like a game on the previous poll. Auto-detected
+    // games must qualify on two consecutive polls, so transient fullscreen
+    // windows (screenshot region pickers, splash screens) don't count.
+    let mut pending: Option<u32> = None;
     let own_pid = std::process::id();
     while !stop.load(Ordering::SeqCst) {
         let procs = process::snapshot();
@@ -130,6 +135,7 @@ fn run(
             }
         }
         rejected.retain(|_, t| t.elapsed() < NEGATIVE_TTL);
+        let was_pending = pending.take();
 
         for p in candidates {
             if p.pid == own_pid || rejected.contains_key(&p.pid) {
@@ -139,6 +145,9 @@ fn run(
             match classify(&facts, &settings) {
                 Verdict::NotAGame => {
                     rejected.insert(p.pid, Instant::now());
+                }
+                Verdict::Detected if was_pending != Some(p.pid) => {
+                    pending = Some(p.pid);
                 }
                 verdict => {
                     let game = DetectedGame {

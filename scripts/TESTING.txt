@@ -28,6 +28,18 @@ SUGGESTED TEST PASS
       (bookmark), Alt+F12 (screenshot).
   [ ] Open the clip in VLC/MPC: audio tracks 1 Master, 2 Game, 3 Mic,
       4 Discord. Windows notification sounds should NOT be on the Game track.
+  [ ] While recording, alt-tab to another app for ~5 s: the clip shows the
+      "Game not in focus" screen for that part, never your desktop. The top
+      bar shows "Not in focus" meanwhile. Status bar should say "Game window".
+  [ ] Gallery: a single click opens the player. Drag the blue handles to trim,
+      "Audio tracks" -> mute Microphone, Save... -> "Save as a copy": a
+      *_edit file appears, trimmed, without mic. Try "Overwrite original" too.
+  [ ] Player "Delete" button removes the clip.
+  [ ] Settings > Audio > Microphone: turn on Noise gate, talk and stay quiet –
+      the badge flips between "open" and "gated"; move the threshold marker.
+  [ ] Settings > Replay buffer: type 4:30 in the length box -> saved clips are
+      ~4.5 min long.
+  [ ] Run ShareX (region capture) or OBS: they must NOT be detected as games.
   [ ] Settings > Audio while capturing: level meters move; volume/mute act live.
   [ ] Right-click a clip: Open file location / Copy to clipboard (paste in
       Explorer or Discord) / Details / Delete.

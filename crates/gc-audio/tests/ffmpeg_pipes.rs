@@ -104,7 +104,7 @@ fn ffmpeg_reads_all_tracks_from_pipes() {
         inputs.push(AudioInput {
             url: path.to_string_lossy().into_owned(),
             in_mix: i != 2,
-            denoise: i == 1,
+            denoise: (i == 1).then_some(12),
         });
         sinks.push(Box::new(Fifo { path, file: None }));
     }
@@ -121,6 +121,8 @@ fn ffmpeg_reads_all_tracks_from_pipes() {
         },
         zero_copy: false,
         gpu_scaler: None,
+        has_scale_d3d11: false,
+        focus_screen: None,
         audio: inputs,
         mixdown: true,
         audio_bitrate_kbps: 128,
@@ -141,6 +143,7 @@ fn ffmpeg_reads_all_tracks_from_pipes() {
             kind: k.clone(),
             volume: 1.0,
             muted: false,
+            gate_db: None,
         })
         .collect();
     let engine = AudioEngine::start(

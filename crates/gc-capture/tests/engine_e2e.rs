@@ -108,7 +108,7 @@ fn replay_and_session_roundtrip() {
     let meta = ClipMetadata::from_tags(&info.tags).expect("embedded metadata");
     assert_eq!(meta.kind, MediaKind::Clip);
     assert_eq!(meta.bookmarks.len(), 1);
-    assert_eq!(info.chapters_ms.len(), 1);
+    assert_eq!(info.chapters_ms.len(), 2, "Start + bookmark");
 
     engine.toggle_recording();
     wait_for(&rx, 10, |ev| match ev {

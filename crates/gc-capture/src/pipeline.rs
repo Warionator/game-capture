@@ -6,7 +6,7 @@ use crate::ffmpeg::Ffmpeg;
 use crate::session::SessionWriter;
 use gc_audio::{AudioEngine, AudioSink, EngineTrack, TrackLevel};
 use gc_core::config::{TrackKind, TrackSpec};
-use gc_core::ffmpeg::PipelineSpec;
+use gc_core::ffmpeg::{focus_command, PipelineSpec};
 use gc_core::ring::{ChunkRef, ReplayRing, Store};
 use gc_core::ts::TsChunker;
 use parking_lot::Mutex;
@@ -42,9 +42,17 @@ pub struct Shared {
     pub bytes: AtomicU64,
     pub exited: AtomicBool,
     pub stderr_tail: Mutex<VecDeque<String>>,
+    pub last_chunk_at: Mutex<Instant>,
+    /// The "Game not in focus" screen is currently shown.
+    pub focus_lost: AtomicBool,
 }
 
 impl Shared {
+    /// No video arrived for `limit` although FFmpeg is still running.
+    pub fn stalled(&self, limit: Duration) -> bool {
+        self.chunks.load(Ordering::SeqCst) > 0 && self.last_chunk_at.lock().elapsed() > limit
+    }
+
     /// Current media time (ring time base).
     pub fn now_media_time(&self) -> f64 {
         self.ring.lock().media_now()
@@ -74,8 +82,9 @@ impl Shared {
 
 pub struct Pipeline {
     child: Child,
-    stdin: Option<ChildStdin>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     reader: Option<JoinHandle<()>>,
+    focus: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
     audio: Option<AudioEngine>,
     pub shared: Arc<Shared>,
     pub spec: PipelineSpec,
@@ -83,11 +92,15 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
+    /// Starts FFmpeg and the audio engine. With a focus screen in `spec`,
+    /// `focus_pid` is the game process: while another process owns the
+    /// foreground window the recording shows the focus screen instead.
     pub fn start(
         ff: &Ffmpeg,
         mut spec: PipelineSpec,
         audio: &AudioPlan,
         ring: RingPlan,
+        focus_pid: Option<u32>,
     ) -> anyhow::Result<Self> {
         let inputs: Vec<&TrackSpec> = audio
             .layout
@@ -132,7 +145,7 @@ impl Pipeline {
             .spawn()?;
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
-        let stdin = child.stdin.take();
+        let stdin = Arc::new(Mutex::new(child.stdin.take()));
 
         let audio_engine = if has_audio {
             let tracks = inputs
@@ -142,6 +155,7 @@ impl Pipeline {
                     kind: t.kind.clone(),
                     volume: t.volume,
                     muted: t.muted,
+                    gate_db: t.gate_db,
                 })
                 .collect();
             match AudioEngine::start(
@@ -171,6 +185,8 @@ impl Pipeline {
             bytes: AtomicU64::new(0),
             exited: AtomicBool::new(false),
             stderr_tail: Mutex::new(VecDeque::new()),
+            last_chunk_at: Mutex::new(Instant::now()),
+            focus_lost: AtomicBool::new(false),
         });
 
         {
@@ -180,7 +196,8 @@ impl Pipeline {
                 .spawn(move || {
                     for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                         let line = line.trim().to_string();
-                        if line.is_empty() {
+                        // Echo of the interactive focus-screen command.
+                        if line.is_empty() || line.starts_with("Enter command:") {
                             continue;
                         }
                         log::warn!("ffmpeg: {line}");
@@ -199,9 +216,22 @@ impl Pipeline {
                 .spawn(move || read_loop(stdout, &shared))?
         };
 
+        let focus = match (spec.focus_screen.is_some(), focus_pid) {
+            (true, Some(pid)) => {
+                let stop = Arc::new(AtomicBool::new(false));
+                let (stop2, shared2, stdin2) = (stop.clone(), shared.clone(), stdin.clone());
+                let t = std::thread::Builder::new()
+                    .name("gc-focus".into())
+                    .spawn(move || focus_loop(pid, &stop2, &shared2, &stdin2))?;
+                Some((stop, t))
+            }
+            _ => None,
+        };
+
         Ok(Self {
             child,
             stdin,
+            focus,
             reader: Some(reader),
             audio: audio_engine,
             shared,
@@ -247,11 +277,26 @@ impl Pipeline {
         }
     }
 
+    pub fn set_gate(&self, title: &str, gate_db: Option<f32>) {
+        if let Some(a) = &self.audio {
+            a.set_gate_by_title(title, gate_db);
+        }
+    }
+
+    /// Whether the focus screen is showing right now.
+    pub fn focus_lost(&self) -> bool {
+        self.shared.focus_lost.load(Ordering::Relaxed)
+    }
+
     /// Graceful stop: ask FFmpeg to quit (flushes the encoder), then kill
     /// if it does not exit in time. Returns the session writer, if any, so
     /// the caller can finalise it.
     pub fn stop(mut self) -> Option<SessionWriter> {
-        if let Some(mut stdin) = self.stdin.take() {
+        if let Some((stop, t)) = self.focus.take() {
+            stop.store(true, Ordering::SeqCst);
+            let _ = t.join();
+        }
+        if let Some(mut stdin) = self.stdin.lock().take() {
             let _ = stdin.write_all(b"q\n");
             let _ = stdin.flush();
         }
@@ -298,6 +343,7 @@ fn read_loop(mut stdout: impl Read, shared: &Shared) {
                 }
             }
         }
+        *shared.last_chunk_at.lock() = Instant::now();
         shared.chunks.fetch_add(1, Ordering::SeqCst);
         shared.bytes.fetch_add(len, Ordering::Relaxed);
     };
@@ -316,4 +362,43 @@ fn read_loop(mut stdout: impl Read, shared: &Shared) {
         handle_chunk(last);
     }
     shared.exited.store(true, Ordering::SeqCst);
+}
+
+/// Polls the foreground window and switches the focus screen on/off.
+/// A change must persist for two polls (~400 ms) so brief popups and
+/// alt-tab flicker don't toggle the picture.
+fn focus_loop(
+    game_pid: u32,
+    stop: &AtomicBool,
+    shared: &Shared,
+    stdin: &Mutex<Option<ChildStdin>>,
+) {
+    let mut shown = false;
+    let mut candidate_since: Option<bool> = None;
+    while !stop.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(200));
+        let in_focus = gc_platform::process::foreground_window().is_some_and(|f| f.pid == game_pid);
+        let want = !in_focus;
+        if want == shown {
+            candidate_since = None;
+            continue;
+        }
+        if candidate_since != Some(want) {
+            candidate_since = Some(want);
+            continue;
+        }
+        candidate_since = None;
+        let mut guard = stdin.lock();
+        let Some(pipe) = guard.as_mut() else { return };
+        if pipe
+            .write_all(focus_command(want).as_bytes())
+            .and_then(|_| pipe.flush())
+            .is_err()
+        {
+            return;
+        }
+        shown = want;
+        shared.focus_lost.store(want, Ordering::Relaxed);
+        log::debug!("focus screen {}", if want { "on" } else { "off" });
+    }
 }

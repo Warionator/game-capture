@@ -8,6 +8,7 @@ export type BufferStorage = "auto" | "memory" | "disk";
 export type ImageFormat = "png" | "jpeg";
 export type MediaKind = "clip" | "session" | "screenshot";
 export type Backend = "nvenc" | "amf" | "qsv" | "software";
+export type CaptureMode = "window" | "monitor";
 
 export type RateControl =
   | { mode: "cbr"; bitrateKbps: number }
@@ -37,6 +38,8 @@ export interface Settings {
   /** Extra folders shown in the gallery (indexed read-only). */
   extraLibraryFolders: string[];
   video: {
+    captureMode: CaptureMode;
+    focusScreen: boolean;
     resolution: Resolution;
     fps: number;
     encoder: EncoderPreference;
@@ -58,10 +61,17 @@ export interface Settings {
   audio: {
     mixdownEnabled: boolean;
     game: AudioSource;
-    mic: AudioSource & { deviceId: string | null; noiseSuppression: boolean };
+    mic: AudioSource & {
+      deviceId: string | null;
+      noiseSuppression: boolean;
+      noiseSuppressionStrength: number;
+      noiseGate: boolean;
+      noiseGateDb: number;
+    };
     voice: AppTrack;
     extraTracks: AppTrack[];
-    systemAudioFallback: boolean;
+    /** null = automatic (on only when per-app capture is unavailable). */
+    systemAudioFallback: boolean | null;
   };
   hotkeys: {
     saveReplay: string;
@@ -150,6 +160,8 @@ export interface EngineStatus {
   ffmpegFound: boolean;
   pendingRestart: boolean;
   encodersProbed: boolean;
+  captureSource: string | null;
+  focusLost: boolean;
 }
 
 export interface EncoderInfo {
@@ -186,6 +198,26 @@ export interface TrackLevel {
   volume: number;
   muted: boolean;
   sources: number;
+  gateOpen: boolean | null;
+}
+
+export interface TrackFile {
+  index: number;
+  title: string;
+  path: string;
+}
+
+export interface TrackGain {
+  index: number;
+  volume: number;
+  muted: boolean;
+}
+
+export interface ExportRequest {
+  startMs: number;
+  endMs: number;
+  gains: TrackGain[] | null;
+  overwrite: boolean;
 }
 
 export interface WindowedProcess {

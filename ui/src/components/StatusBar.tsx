@@ -1,4 +1,4 @@
-import { Bookmark, Camera, Circle, Gamepad2, Monitor, Pause, Play, Save, Square, Zap } from "lucide-react";
+import { Bookmark, Camera, Circle, EyeOff, Gamepad2, Monitor, Pause, Play, Save, Square, Zap } from "lucide-react";
 import { api } from "../lib/api";
 import { cx, formatBytes, formatDuration } from "../lib/format";
 import { useStore } from "../lib/store";
@@ -55,11 +55,19 @@ export function StatusBar() {
               {status.game ? <Gamepad2 size={14} /> : active ? <Monitor size={14} /> : null}
               <span className="truncate">{status.game?.displayName ?? (active ? "Desktop" : "")}</span>
             </span>
+            {active && status.focusLost && (
+              <span title="You're tabbed out – the recording shows the “Game not in focus” screen">
+                <Badge tone="warn">
+                  <EyeOff size={10} /> Not in focus
+                </Badge>
+              </span>
+            )}
           </div>
           <div className="mt-0.5 flex items-center gap-2 text-[11px] text-faint">
             {status.encoderLabel ? (
               <>
                 <span>{status.encoderLabel}</span>
+                {status.captureSource && <span>· {status.captureSource}</span>}
                 {status.outputSize && (
                   <span>
                     {status.outputSize[0]}×{status.outputSize[1]} · {status.fps ? `${status.fps} fps` : "uncapped"}

@@ -6,9 +6,14 @@ import { useStore } from "../lib/store";
 import type { AppTrack, AudioDevice, AudioSource, Settings, TrackLevel } from "../lib/types";
 import { Badge, Button, Field, IconButton, Section, Select, TextInput, Toggle } from "../components/ui";
 
+interface Levels {
+  peaks: Record<string, number>;
+  gateOpen: Record<string, boolean | null>;
+}
+
 /** Polls peak levels and applies a fall-off so meters move smoothly. */
-function useLevels(): Record<string, number> {
-  const [levels, setLevels] = useState<Record<string, number>>({});
+function useLevels(): Levels {
+  const [levels, setLevels] = useState<Levels>({ peaks: {}, gateOpen: {} });
   const held = useRef<Record<string, number>>({});
   useEffect(() => {
     let live = true;
@@ -18,9 +23,13 @@ function useLevels(): Record<string, number> {
         .then((ls: TrackLevel[]) => {
           if (!live) return;
           const next: Record<string, number> = {};
-          for (const l of ls) next[l.title] = Math.max(l.peak, (held.current[l.title] ?? 0) * 0.8);
+          const gate: Record<string, boolean | null> = {};
+          for (const l of ls) {
+            next[l.title] = Math.max(l.peak, (held.current[l.title] ?? 0) * 0.8);
+            gate[l.title] = l.gateOpen;
+          }
           held.current = next;
-          setLevels(next);
+          setLevels({ peaks: next, gateOpen: gate });
         })
         .catch(() => {});
     const t = window.setInterval(tick, 80);
@@ -32,15 +41,37 @@ function useLevels(): Record<string, number> {
   return levels;
 }
 
-function Meter({ peak }: { peak: number | undefined }) {
-  const db = peak && peak > 0 ? 20 * Math.log10(peak) : -60;
-  const pct = Math.max(0, Math.min(100, ((db + 60) / 60) * 100));
+const METER_FLOOR_DB = -80;
+const dbToPct = (db: number) => Math.max(0, Math.min(100, ((db - METER_FLOOR_DB) / -METER_FLOOR_DB) * 100));
+
+/** Level meter (dBFS). With a noise gate, a marker shows the threshold and the
+ *  bar dims while the gate is closed. */
+function Meter({ peak, gateDb, gateOpen }: { peak: number | undefined; gateDb?: number | null; gateOpen?: boolean | null }) {
+  const db = peak && peak > 0 ? 20 * Math.log10(peak) : METER_FLOOR_DB;
+  const closed = gateDb != null && gateOpen === false;
   return (
-    <div className="relative h-1.5 w-full overflow-hidden rounded bg-line" role="meter" aria-valuenow={Math.round(db)} aria-valuemin={-60} aria-valuemax={0} aria-label="Level">
+    <div
+      className="relative h-1.5 w-full rounded bg-line"
+      role="meter"
+      aria-valuenow={Math.round(db)}
+      aria-valuemin={METER_FLOOR_DB}
+      aria-valuemax={0}
+      aria-label="Level"
+    >
       <div
-        className={cx("h-full transition-[width] duration-75", db > -3 ? "bg-rec" : db > -12 ? "bg-warn" : "bg-ok")}
-        style={{ width: `${pct}%` }}
+        className={cx(
+          "h-full rounded transition-[width] duration-75",
+          closed ? "bg-faint/60" : db > -3 ? "bg-rec" : db > -12 ? "bg-warn" : "bg-ok",
+        )}
+        style={{ width: `${dbToPct(db)}%` }}
       />
+      {gateDb != null && (
+        <div
+          className="absolute -top-1 h-3.5 w-0.5 -translate-x-1/2 rounded bg-sky-300"
+          style={{ left: `${dbToPct(gateDb)}%` }}
+          title={`Gate threshold ${gateDb} dB`}
+        />
+      )}
     </div>
   );
 }
@@ -51,6 +82,8 @@ function TrackRow({
   icon,
   source,
   peak,
+  gateDb,
+  gateOpen,
   onChange,
   children,
   removable,
@@ -61,6 +94,8 @@ function TrackRow({
   icon?: React.ReactNode;
   source: AudioSource;
   peak: number | undefined;
+  gateDb?: number | null;
+  gateOpen?: boolean | null;
   onChange: (s: Partial<AudioSource>) => void;
   children?: React.ReactNode;
   removable?: boolean;
@@ -90,7 +125,7 @@ function TrackRow({
             onChange={(e) => onChange({ volume: Number(e.target.value) / 100 })}
             className="h-1.5 w-full cursor-pointer"
           />
-          <Meter peak={source.enabled && !source.muted ? peak : 0} />
+          <Meter peak={source.enabled && !source.muted ? peak : 0} gateDb={gateDb} gateOpen={gateOpen} />
         </div>
         <span className="w-12 text-right font-mono text-xs text-muted tabular-nums">{Math.round(source.volume * 100)}%</span>
         {removable && (
@@ -129,12 +164,63 @@ function ExeInput({ value, onChange }: { value: string[]; onChange: (v: string[]
   );
 }
 
+function MicControl({
+  label,
+  hint,
+  enabled,
+  onToggle,
+  value,
+  min,
+  max,
+  format,
+  onValue,
+  status,
+}: {
+  label: string;
+  hint: string;
+  enabled: boolean;
+  onToggle: (b: boolean) => void;
+  value: number;
+  min: number;
+  max: number;
+  format: (v: number) => string;
+  onValue: (v: number) => void;
+  status?: "open" | "closed";
+}) {
+  return (
+    <div>
+      <div className="flex items-center gap-3">
+        <Toggle label={label} checked={enabled} onChange={onToggle} />
+        <span className="w-32 shrink-0 text-xs font-medium text-fg">{label}</span>
+        <input
+          type="range"
+          aria-label={`${label} level`}
+          min={min}
+          max={max}
+          step={1}
+          value={value}
+          disabled={!enabled}
+          onChange={(e) => onValue(Number(e.target.value))}
+          className="h-1.5 min-w-0 flex-1 cursor-pointer disabled:opacity-40"
+        />
+        <span className="w-14 shrink-0 text-right font-mono text-xs tabular-nums">{format(value)}</span>
+        <span className="w-14 shrink-0 text-right">
+          {status && <Badge tone={status === "open" ? "ok" : "default"}>{status === "open" ? "open" : "gated"}</Badge>}
+        </span>
+      </div>
+      <p className="mt-1 ml-12 text-[11px] leading-relaxed text-faint">{hint}</p>
+    </div>
+  );
+}
+
 export function AudioTab() {
   const { settings, update, status } = useStore();
   const levels = useLevels();
   const [devices, setDevices] = useState<AudioDevice[]>([]);
+  const [loopback, setLoopback] = useState<boolean | null>(null);
   useEffect(() => {
     api.listAudioDevices().then(setDevices).catch(() => {});
+    api.systemInfo().then((i) => setLoopback(i.processLoopback)).catch(() => {});
   }, []);
   if (!settings) return null;
   const a = settings.audio;
@@ -170,7 +256,7 @@ export function AudioTab() {
           index={idx()}
           title="Game"
           source={a.game}
-          peak={levels["Game"]}
+          peak={levels.peaks["Game"]}
           onChange={(p) => change("Game", (x) => x.audio.game, p)}
         />
         <TrackRow
@@ -178,7 +264,9 @@ export function AudioTab() {
           title="Microphone"
           icon={<Mic size={13} className="text-faint" />}
           source={a.mic}
-          peak={levels["Microphone"]}
+          peak={levels.peaks["Microphone"]}
+          gateDb={a.mic.noiseGate ? a.mic.noiseGateDb : null}
+          gateOpen={levels.gateOpen["Microphone"]}
           onChange={(p) => change("Microphone", (x) => x.audio.mic, p)}
         >
           <label className="flex items-center gap-2">
@@ -194,20 +282,43 @@ export function AudioTab() {
               ]}
             />
           </label>
-          <label className="flex items-center gap-2">
-            <Toggle
+          <div className="flex w-full flex-col gap-2.5 pt-1">
+            <MicControl
               label="Noise suppression"
-              checked={a.mic.noiseSuppression}
-              onChange={(b) => update((x) => void (x.audio.mic.noiseSuppression = b))}
+              hint="Removes steady background noise (fans, hum). Stronger values can make voices sound thin. Restarts the buffer when changed."
+              enabled={a.mic.noiseSuppression}
+              onToggle={(b) => update((x) => void (x.audio.mic.noiseSuppression = b))}
+              value={a.mic.noiseSuppressionStrength}
+              min={1}
+              max={40}
+              format={(v) => `${v} dB`}
+              onValue={(v) => update((x) => void (x.audio.mic.noiseSuppressionStrength = v))}
             />
-            Noise suppression
-          </label>
+            <MicControl
+              label="Noise gate"
+              hint="Mutes the mic while it is quieter than the threshold (the blue marker on the meter). Set it just above your room noise. Applies live."
+              enabled={a.mic.noiseGate}
+              onToggle={(b) => update((x) => void (x.audio.mic.noiseGate = b))}
+              value={a.mic.noiseGateDb}
+              min={-80}
+              max={-10}
+              format={(v) => `${v} dB`}
+              onValue={(v) => update((x) => void (x.audio.mic.noiseGateDb = v))}
+              status={
+                a.mic.noiseGate && levels.gateOpen["Microphone"] != null
+                  ? levels.gateOpen["Microphone"]
+                    ? "open"
+                    : "closed"
+                  : undefined
+              }
+            />
+          </div>
         </TrackRow>
         <TrackRow
           index={idx()}
           title={voiceTitle}
           source={a.voice}
-          peak={levels[voiceTitle]}
+          peak={levels.peaks[voiceTitle]}
           onChange={(p) => change(voiceTitle, (x) => x.audio.voice, p)}
         >
           <ExeInput value={a.voice.executables} onChange={(v) => update((x) => void (x.audio.voice.executables = v))} />
@@ -228,7 +339,7 @@ export function AudioTab() {
               index={idx()}
               title={title}
               source={t}
-              peak={levels[title]}
+              peak={levels.peaks[title]}
               onChange={(p) => change(title, (x) => x.audio.extraTracks[i], p)}
               removable
               onRemove={() => update((x) => void x.audio.extraTracks.splice(i, 1))}
@@ -277,11 +388,16 @@ export function AudioTab() {
       <Section title="Compatibility">
         <Field
           label="System audio fallback"
-          hint="Windows builds older than 19041 cannot isolate a process. Record all desktop audio as the game track instead of silence."
+          hint={
+            loopback
+              ? "Not needed: this Windows version records each app separately."
+              : "This Windows build (older than 19041) can't isolate an app's audio. Record all desktop audio as the game track instead of silence."
+          }
         >
           <Toggle
             label="System audio fallback"
-            checked={a.systemAudioFallback}
+            disabled={loopback !== false}
+            checked={loopback === false ? (a.systemAudioFallback ?? true) : false}
             onChange={(b) => update((x) => void (x.audio.systemAudioFallback = b))}
           />
         </Field>

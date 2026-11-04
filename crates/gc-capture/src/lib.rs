@@ -8,6 +8,7 @@
 //! replay or finishing a session remuxes the buffered stream (stream copy, no
 //! re-encode) into MP4/MKV with embedded metadata.
 
+pub mod edit;
 mod engine;
 mod ffmpeg;
 mod pipeline;

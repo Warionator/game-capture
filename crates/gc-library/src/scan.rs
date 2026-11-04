@@ -162,6 +162,8 @@ pub fn item_from_probe(
         _ => info
             .chapters_ms
             .iter()
+            // Our leading "Start" chapter (and any other at 0) is not a bookmark.
+            .filter(|&&ms| ms > 0)
             .map(|&offset_ms| Bookmark {
                 offset_ms,
                 label: None,

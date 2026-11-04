@@ -79,6 +79,8 @@ let settings: Settings = {
   storageRoot: "D:\\Videos\\game-capture",
   extraLibraryFolders: [],
   video: {
+    captureMode: "window",
+    focusScreen: true,
     resolution: "native",
     fps: 60,
     encoder: "auto",
@@ -93,10 +95,19 @@ let settings: Settings = {
   audio: {
     mixdownEnabled: true,
     game: { enabled: true, volume: 1, muted: false },
-    mic: { enabled: true, volume: 1, muted: false, deviceId: null, noiseSuppression: true },
+    mic: {
+      enabled: true,
+      volume: 1,
+      muted: false,
+      deviceId: null,
+      noiseSuppression: true,
+      noiseSuppressionStrength: 12,
+      noiseGate: true,
+      noiseGateDb: -45,
+    },
     voice: { name: "Discord", executables: ["Discord.exe"], enabled: true, volume: 0.8, muted: false, includeInMix: true },
     extraTracks: [{ name: "Spotify", executables: ["Spotify.exe"], enabled: true, volume: 0.5, muted: false, includeInMix: false }],
-    systemAudioFallback: true,
+    systemAudioFallback: null,
   },
   hotkeys: { saveReplay: "Alt+F10", toggleRecording: "Alt+F9", addBookmark: "Alt+F8", screenshot: "Alt+F12" },
   screenshot: { format: "png", jpegQuality: 92 },
@@ -123,6 +134,8 @@ let status: EngineStatus = {
   ffmpegFound: true,
   pendingRestart: false,
   encodersProbed: true,
+  captureSource: "Game window",
+  focusLost: false,
 };
 
 setInterval(() => {
@@ -188,10 +201,10 @@ function levels(): TrackLevel[] {
   levelPhase += 0.35;
   const wave = (k: number) => Math.max(0, Math.min(1, 0.35 + 0.3 * Math.sin(levelPhase * k) + Math.random() * 0.25));
   return [
-    { title: "Game", peak: settings.audio.game.muted ? 0 : wave(1.1) * settings.audio.game.volume, volume: settings.audio.game.volume, muted: settings.audio.game.muted, sources: 1 },
-    { title: "Microphone", peak: settings.audio.mic.muted ? 0 : wave(2.3) * 0.6, volume: settings.audio.mic.volume, muted: settings.audio.mic.muted, sources: 1 },
-    { title: "Discord", peak: wave(0.7) * 0.5, volume: settings.audio.voice.volume, muted: settings.audio.voice.muted, sources: 1 },
-    { title: "Spotify", peak: wave(0.4) * 0.4, volume: 0.5, muted: false, sources: 0 },
+    { title: "Game", peak: settings.audio.game.muted ? 0 : wave(1.1) * settings.audio.game.volume, volume: settings.audio.game.volume, muted: settings.audio.game.muted, sources: 1, gateOpen: null },
+    { title: "Microphone", peak: settings.audio.mic.muted ? 0 : wave(2.3) * 0.6, volume: settings.audio.mic.volume, muted: settings.audio.mic.muted, sources: 1, gateOpen: settings.audio.mic.noiseGate ? Math.sin(levelPhase * 2.3) > -0.2 : null },
+    { title: "Discord", peak: wave(0.7) * 0.5, volume: settings.audio.voice.volume, muted: settings.audio.voice.muted, sources: 1, gateOpen: null },
+    { title: "Spotify", peak: wave(0.4) * 0.4, volume: 0.5, muted: false, sources: 0, gateOpen: null },
   ];
 }
 
@@ -225,6 +238,20 @@ const handlers: Record<string, (a: Record<string, unknown>) => unknown> = {
     { pid: 6001, exeName: "Discord.exe", exePath: "C:\\Users\\me\\AppData\\Local\\Discord\\Discord.exe", windowTitle: "#general - Discord", displayName: "Discord" },
   ],
   process_icon: () => null,
+  prepare_audio_tracks: (a) => {
+    const m = media.find((x) => x.id === a.id);
+    if (!m || m.audioTracks.length < 2) return [];
+    return m.audioTracks.slice(1).map((title, i) => ({ index: i + 1, title, path: "" }));
+  },
+  export_clip: (a) => {
+    const m = media.find((x) => x.id === a.id)!;
+    const r = a.request as { startMs: number; endMs: number; overwrite: boolean };
+    const out = { ...m, durationMs: r.endMs - r.startMs, mtimeMs: Date.now() };
+    if (r.overwrite) Object.assign(m, out);
+    else media.unshift({ ...out, id: nextId++, path: m.path.replace(/(\.\w+)$/, "_edit$1") });
+    setTimeout(() => emit("library-changed", {}), 50);
+    return r.overwrite ? m : media[0];
+  },
   add_custom_game: (a) => {
     const path = a.exePath as string;
     const exe = path.split("\\").pop() ?? path;
@@ -315,7 +342,10 @@ export const mock = {
     return Promise.resolve(() => listeners.get(event)?.delete(handler));
   },
   fileUrl(path: string): string | undefined {
-    // Only generated placeholders are viewable in the browser mock.
-    return path.startsWith("data:") ? path : undefined;
+    // Only generated placeholders are viewable in the browser mock. For UI
+    // work, set `window.__GC_MOCK_VIDEO__` to a sample video URL.
+    if (path.startsWith("data:")) return path;
+    const sample = (globalThis as { __GC_MOCK_VIDEO__?: string }).__GC_MOCK_VIDEO__;
+    return sample && /\.(mp4|mkv)$/i.test(path) ? sample : undefined;
   },
 };

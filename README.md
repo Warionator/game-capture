@@ -14,16 +14,18 @@ per process with the WASAPI process-loopback API.
 | Area | What it does |
 | --- | --- |
 | Game detection | Polls processes, inspects the foreground process for loaded D3D9/11/12, Vulkan or OpenGL modules, fullscreen windows, launcher install paths and Microsoft Store packages. Names come from version info / package manifests / install folders; icons are extracted to PNG. Manual override: pick a running window or browse for an `.exe`. |
-| Capture | `ddagrab` (Desktop Duplication) feeds D3D11 textures directly to the hardware encoder — no CPU pixel copies and **no API hooks / DLL injection**, so anti-cheat is not triggered. Windowed games are cropped to their window. GPU-side scaling via `scale_d3d11` / `vpp_amf` / `scale_qsv`. |
+| Capture | Games are captured with **Windows Graphics Capture of the game window only** (`gfxcapture`), so other apps and notifications never appear; monitor capture (`ddagrab`, Desktop Duplication) is the fallback and an option. D3D11 textures go directly to the hardware encoder — no CPU pixel copies and **no API hooks / DLL injection**, so anti-cheat is not triggered. GPU-side scaling via `scale_d3d11` / `vpp_amf` / `scale_qsv`. |
+| Focus screen | While the game is not the foreground window, the recording switches (live, via `streamselect`) to a "Game not in focus" screen. |
 | Encoders | Probed at startup by encoding test frames: NVENC → AMF → QuickSync → software (x264 / x265 / SVT-AV1). H.264, HEVC and AV1. If a configuration fails to start, the engine retries without zero-copy and then with the next encoder. |
-| Audio | Track 1 master mix · Track 2 game (process tree only) · Track 3 microphone (device choice, noise suppression) · Track 4 Discord (by executable) · any number of extra app tracks. Live per-track gain, mute and peak meters. |
+| Audio | Track 1 master mix · Track 2 game (process tree only) · Track 3 microphone (device choice, adjustable noise suppression, live noise gate with threshold marker on the meter) · Track 4 Discord (by executable) · any number of extra app tracks. Live per-track gain, mute and peak meters. |
 | Replay buffer | 15 s – 20 min of keyframe-aligned MPEG-TS chunks kept in RAM, spilling to disk (ideally NVMe) when the window does not fit the RAM budget. Saving is a stream copy — no re-encode. |
 | Recording | Session recording shares the same encoder as the replay buffer (one GPU encode). Written crash-safely as MPEG-TS and remuxed to MP4/MKV on stop; interrupted sessions are recovered on next launch. |
 | Hotkeys | Global low-level keyboard hook (`SetWindowsHookEx`): save replay, toggle recording, bookmark, screenshot. |
 | Bookmarks | Stored in the embedded metadata and as container chapters; shown as markers on the player timeline. |
 | Screenshots | PNG/JPEG straight from the duplicated GPU framebuffer. |
 | Library | `<root>/<Game>/<YYYY-MM-DD_HH-MM-SS>_<Kind>.<ext>` (Kind = Clip, Session or Screenshot). Metadata (`game_title`, `executable_name`, `timestamp`, `duration`, `bookmarks`, `resolution`, …) is embedded in every file. A SQLite cache makes the gallery instant; the self-healing scanner rebuilds it — including thumbnails — from the files alone after a reinstall or backup restore. |
-| Gallery | Grid grouped by game or date, filters for game, type, date, duration, search and sort; right-click: open location, open externally, copy file to clipboard, details/bookmarks, delete. Built-in player with bookmark timeline. |
+| Gallery | Grid grouped by game or date, filters for game, type, date, duration, search and sort; right-click: open location, open externally, copy file to clipboard, details/bookmarks, delete. Only the library folder and folders you add are shown. |
+| Player & editor | Single click opens the player: bookmark timeline, Master mix by default, or the individual tracks with their own volume/mute. Drag the handles to trim; save the trim and track levels over the original or as a copy (lossless video copy). |
 | System | Optional *Disable Windows Game Mode* (`HKCU\Software\Microsoft\GameBar`), start with Windows (`HKCU\…\Run`, `--minimized`), tray icon with Pause / Save Replay / Dashboard / Settings / Quit. |
 
 ## Repository layout

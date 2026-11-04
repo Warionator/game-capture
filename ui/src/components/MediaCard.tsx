@@ -31,9 +31,10 @@ export function MediaCard({
   const date = new Date(item.createdMs).toLocaleDateString(undefined, { month: "short", day: "numeric" });
   return (
     <button
-      onClick={onSelect}
-      onDoubleClick={onOpen}
-      onKeyDown={(e) => e.key === "Enter" && onOpen()}
+      onClick={() => {
+        onSelect();
+        onOpen();
+      }}
       onContextMenu={(e) => {
         e.preventDefault();
         onSelect();

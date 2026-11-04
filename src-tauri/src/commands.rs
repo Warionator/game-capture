@@ -148,6 +148,97 @@ pub async fn rescan_library(app: AppHandle, state: St<'_>) -> CmdResult<Option<S
         .map_err(err)
 }
 
+/// Extracts the individual audio tracks of a clip for per-track playback.
+/// For game-capture clips (Master + isolated tracks) only the isolated
+/// tracks are returned; the video element itself plays the Master track.
+#[tauri::command]
+pub async fn prepare_audio_tracks(
+    state: St<'_>,
+    id: i64,
+) -> CmdResult<Vec<gc_capture::edit::TrackFile>> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (item, path) = media_path(&state, id)?;
+        let ff = state.ffmpeg.clone().ok_or("FFmpeg is missing")?;
+        let n = item.audio_tracks.len();
+        let master = n > 1 && item.audio_tracks[0].eq_ignore_ascii_case("Master");
+        let indices: Vec<usize> = match (n, master) {
+            (0 | 1, _) => vec![],
+            (_, true) => (1..n).collect(),
+            (_, false) => (0..n).collect(),
+        };
+        let key = format!("{}-{}", item.id, item.mtime_ms);
+        gc_capture::edit::extract_tracks(
+            &ff,
+            &path,
+            &key,
+            &item.audio_tracks,
+            &indices,
+            &state.track_cache,
+        )
+        .map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Saves a trimmed / re-mixed clip, over the original or as a copy.
+#[tauri::command]
+pub async fn export_clip(
+    app: AppHandle,
+    state: St<'_>,
+    id: i64,
+    request: gc_capture::edit::ExportRequest,
+) -> CmdResult<MediaItem> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (item, path) = media_path(&state, id)?;
+        let ff = state.ffmpeg.clone().ok_or("FFmpeg is missing")?;
+        let fallback = gc_core::metadata::ClipMetadata {
+            version: gc_core::metadata::SCHEMA_VERSION,
+            kind: item.kind,
+            game_title: item.game_title.clone(),
+            executable_name: item.executable.clone(),
+            timestamp: chrono::DateTime::from_timestamp_millis(item.created_ms)
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_default(),
+            duration_ms: item.duration_ms,
+            bookmarks: item.bookmarks.clone(),
+            resolution: item.width.zip(item.height).map(|(w, h)| format!("{w}x{h}")),
+            encoder: None,
+            audio_tracks: item.audio_tracks.clone(),
+        };
+        let out = gc_capture::edit::export_clip(&ff, &path, &request, fallback, &state.temp_dir)
+            .map_err(|e| format!("{e:#}"))?;
+        if request.overwrite {
+            if let Some(t) = &item.thumbnail {
+                let _ = std::fs::remove_file(t);
+            }
+        }
+        let inspector = state.inspector.clone().ok_or("FFmpeg is missing")?;
+        // Index relative to whichever library folder holds the file.
+        let root = {
+            let st = state.settings.read();
+            st.library_roots()
+                .into_iter()
+                .find(|r| gc_core::naming::is_under(&out, r))
+                .unwrap_or_else(|| st.storage_root.clone())
+        };
+        let saved = gc_library::index_file(
+            &state.library,
+            &root,
+            &state.thumbs_dir,
+            inspector.as_ref(),
+            &out,
+        )
+        .map_err(err)?;
+        let _ = app.emit("library-changed", ScanReport::default());
+        Ok(saved)
+    })
+    .await
+    .map_err(err)?
+}
+
 #[tauri::command]
 pub fn list_processes() -> Vec<process::WindowedProcess> {
     process::windowed_processes()

@@ -20,7 +20,7 @@ mod pipe;
 #[cfg(windows)]
 mod wasapi;
 
-pub use buffer::{apply_gain, peak, SampleRing, TrackControl};
+pub use buffer::{apply_gain, peak, NoiseGate, SampleRing, TrackControl};
 pub use engine::{
     AudioEngine, AudioSink, CaptureHandle, CaptureTarget, EngineTrack, FileSink, SourceFactory,
     TrackLevel,

@@ -307,7 +307,22 @@ export function Gallery({ game, onLibraryChanged }: { game: string | null; onLib
       </div>
 
       {menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems(menu.item)} onClose={() => setMenu(null)} />}
-      {playing && <Player item={playing.item} startMs={playing.startMs} onClose={() => setPlaying(null)} />}
+      {playing && (
+        <Player
+          key={playing.item.id}
+          item={playing.item}
+          startMs={playing.startMs}
+          onClose={() => {
+            setPlaying(null);
+            reload();
+          }}
+          onDeleted={(id) => {
+            setPlaying(null);
+            setItems((xs) => xs.filter((x) => x.id !== id));
+            onLibraryChanged();
+          }}
+        />
+      )}
       {details && (
         <DetailsDialog
           item={details}

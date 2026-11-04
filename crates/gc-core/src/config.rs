@@ -116,6 +116,14 @@ impl Settings {
             src.volume = src.volume.clamp(0.0, 2.0);
         }
         self.screenshot.jpeg_quality = self.screenshot.jpeg_quality.clamp(10, 100);
+        let mic = &mut self.audio.mic;
+        mic.noise_suppression_strength = mic.noise_suppression_strength.clamp(1, 40);
+        mic.noise_gate_db = if mic.noise_gate_db.is_finite() {
+            mic.noise_gate_db
+                .clamp(NOISE_GATE_MIN_DB, NOISE_GATE_MAX_DB)
+        } else {
+            -45.0
+        };
     }
 
     /// Whether changing from `self` to `other` requires restarting the
@@ -134,6 +142,8 @@ impl Settings {
             || self.replay.storage != other.replay.storage
             || self.audio.mic.device_id != other.audio.mic.device_id
             || self.audio.mic.noise_suppression != other.audio.mic.noise_suppression
+            || self.audio.mic.noise_suppression_strength
+                != other.audio.mic.noise_suppression_strength
             || self.audio.mixdown_enabled != other.audio.mixdown_enabled
             || tracks(self) != tracks(other)
     }
@@ -265,9 +275,25 @@ impl Container {
     }
 }
 
+/// How a running game is captured.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum CaptureMode {
+    /// Windows Graphics Capture of the game window only: other windows and
+    /// notifications can never appear in a clip.
+    #[default]
+    Window,
+    /// DXGI Desktop Duplication of the monitor the game is on.
+    Monitor,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct VideoSettings {
+    pub capture_mode: CaptureMode,
+    /// Replace the picture with a "Game not in focus" screen while another
+    /// window is in front of the game.
+    pub focus_screen: bool,
     pub resolution: Resolution,
     pub fps: FrameRate,
     pub encoder: EncoderPreference,
@@ -286,6 +312,8 @@ pub struct VideoSettings {
 impl Default for VideoSettings {
     fn default() -> Self {
         Self {
+            capture_mode: CaptureMode::Window,
+            focus_screen: true,
             resolution: Resolution::Native,
             fps: FrameRate::default(),
             encoder: EncoderPreference::Auto,
@@ -426,8 +454,20 @@ pub struct MicSettings {
     pub source: AudioSource,
     /// WASAPI endpoint id; `None` = default communications device.
     pub device_id: Option<String>,
+    /// FFmpeg `afftdn` spectral denoiser.
     pub noise_suppression: bool,
+    /// Denoise strength in dB (`afftdn` noise reduction), 1–40.
+    pub noise_suppression_strength: u8,
+    /// Noise gate: silence the mic while its level is below the threshold.
+    /// Applied live (no restart), so the threshold can be tuned while
+    /// watching the level meter.
+    pub noise_gate: bool,
+    /// Gate threshold in dBFS (-80 – -10).
+    pub noise_gate_db: f32,
 }
+
+pub const NOISE_GATE_MIN_DB: f32 = -80.0;
+pub const NOISE_GATE_MAX_DB: f32 = -10.0;
 
 impl Default for MicSettings {
     fn default() -> Self {
@@ -438,6 +478,9 @@ impl Default for MicSettings {
             },
             device_id: None,
             noise_suppression: true,
+            noise_suppression_strength: 12,
+            noise_gate: false,
+            noise_gate_db: -45.0,
         }
     }
 }
@@ -480,7 +523,8 @@ pub struct AudioSettings {
     pub extra_tracks: Vec<AppTrack>,
     /// When the OS lacks process loopback (< build 19041) capture the whole
     /// system mix as the game track instead of recording silence.
-    pub system_audio_fallback: bool,
+    /// `None` = automatic: on only when per-app capture is unavailable.
+    pub system_audio_fallback: Option<bool>,
 }
 
 impl Default for AudioSettings {
@@ -495,7 +539,7 @@ impl Default for AudioSettings {
                 ..AppTrack::default()
             },
             extra_tracks: Vec::new(),
-            system_audio_fallback: true,
+            system_audio_fallback: None,
         }
     }
 }
@@ -523,8 +567,10 @@ pub struct TrackSpec {
     pub in_mix: bool,
     pub volume: f32,
     pub muted: bool,
-    /// Apply FFmpeg's `afftdn` denoiser (microphone only).
-    pub denoise: bool,
+    /// FFmpeg `afftdn` denoiser strength in dB (microphone only).
+    pub denoise: Option<u8>,
+    /// Live noise-gate threshold in dBFS (microphone only).
+    pub gate_db: Option<f32>,
 }
 
 impl AudioSettings {
@@ -545,7 +591,8 @@ impl AudioSettings {
                 in_mix: true,
                 volume: self.game.volume,
                 muted: self.game.muted,
-                denoise: false,
+                denoise: None,
+                gate_db: None,
             });
         }
         if self.mic.source.enabled {
@@ -555,7 +602,11 @@ impl AudioSettings {
                 in_mix: true,
                 volume: self.mic.source.volume,
                 muted: self.mic.source.muted,
-                denoise: self.mic.noise_suppression,
+                denoise: self
+                    .mic
+                    .noise_suppression
+                    .then_some(self.mic.noise_suppression_strength),
+                gate_db: self.mic.noise_gate.then_some(self.mic.noise_gate_db),
             });
         }
         for app in std::iter::once(&self.voice).chain(self.extra_tracks.iter()) {
@@ -572,7 +623,8 @@ impl AudioSettings {
                     in_mix: app.include_in_mix,
                     volume: app.source.volume,
                     muted: app.source.muted,
-                    denoise: false,
+                    denoise: None,
+                    gate_db: None,
                 });
             }
         }
@@ -590,7 +642,8 @@ impl AudioSettings {
                 in_mix: false,
                 volume: 1.0,
                 muted: false,
-                denoise: false,
+                denoise: None,
+                gate_db: None,
             });
         }
         out.extend(inputs);
@@ -838,7 +891,9 @@ mod tests {
         let mut b = a.clone();
         b.audio.game.volume = 0.5;
         b.audio.voice.source.muted = true;
-        assert!(!a.pipeline_differs(&b));
+        b.audio.mic.noise_gate = true;
+        b.audio.mic.noise_gate_db = -30.0;
+        assert!(!a.pipeline_differs(&b), "gate and volume are applied live");
         b.video.codec = Codec::Av1;
         assert!(a.pipeline_differs(&b));
     }

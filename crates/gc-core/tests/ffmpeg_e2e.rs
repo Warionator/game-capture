@@ -59,16 +59,18 @@ fn encode_chunk_ring_remux_probe() {
         },
         zero_copy: false,
         gpu_scaler: None,
+        has_scale_d3d11: false,
+        focus_screen: None,
         audio: vec![
             AudioInput {
                 url: urls[0].clone(),
                 in_mix: true,
-                denoise: false,
+                denoise: None,
             },
             AudioInput {
                 url: urls[1].clone(),
                 in_mix: true,
-                denoise: true,
+                denoise: Some(12),
             },
         ],
         mixdown: true,
@@ -163,7 +165,7 @@ fn encode_chunk_ring_remux_probe() {
             "{ext}: {}",
             info.duration_ms
         );
-        assert_eq!(info.chapters_ms, [500], "{ext}");
+        assert_eq!(info.chapters_ms, [0, 500], "{ext}");
         let recovered =
             ClipMetadata::from_tags(&info.tags).unwrap_or_else(|| panic!("{ext}: {:?}", info.tags));
         assert_eq!(recovered, meta, "{ext}");

@@ -15,8 +15,10 @@ import type {
   MonitorInfo,
   Notice,
   ScanReport,
+  ExportRequest,
   Settings,
   SystemInfo,
+  TrackFile,
   TrackLevel,
   WindowedProcess,
 } from "./types";
@@ -44,6 +46,8 @@ export const api = {
   openStorageFolder: () => call<void>("open_storage_folder"),
   rescanLibrary: () => call<ScanReport | null>("rescan_library"),
   listProcesses: () => call<WindowedProcess[]>("list_processes"),
+  prepareAudioTracks: (id: number) => call<TrackFile[]>("prepare_audio_tracks", { id }),
+  exportClip: (id: number, request: ExportRequest) => call<MediaItem>("export_clip", { id, request }),
   processIcon: (path: string) => call<string | null>("process_icon", { path }),
   addCustomGame: (exePath: string, displayName?: string) =>
     call<Settings>("add_custom_game", { exePath, displayName: displayName ?? null }),
@@ -79,10 +83,12 @@ export async function on<K extends keyof EventMap>(
 }
 
 /** URL for a local file (thumbnail, video) usable in <img>/<video>. */
-export function fileUrl(path: string | null | undefined): string | undefined {
+export function fileUrl(path: string | null | undefined, version?: number): string | undefined {
   if (!path) return undefined;
   if (!inTauri) return mock.fileUrl(path);
-  return convertFileSrc(path);
+  const url = convertFileSrc(path);
+  // Cache-bust after a file was overwritten in place (clip editor).
+  return version ? `${url}?v=${version}` : url;
 }
 
 export async function pickFolder(title: string): Promise<string | null> {

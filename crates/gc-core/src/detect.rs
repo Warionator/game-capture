@@ -89,7 +89,71 @@ const NOT_GAMES: &[&str] = &[
     "unrealeditor.exe",
     "game-capture.exe",
     "ffmpeg.exe",
+    "ffplay.exe",
+    // Capture, streaming and screenshot tools: they render with D3D and
+    // often show fullscreen overlays (region pickers), but are never games.
+    "sharex.exe",
+    "obs32.exe",
+    "streamlabs obs.exe",
+    "streamlabs desktop.exe",
+    "xsplit.core.exe",
+    "xsplitbroadcaster.exe",
+    "medal.exe",
+    "medalencoder.exe",
+    "nvidia share.exe",
+    "nvsphelper64.exe",
+    "nvidia overlay.exe",
+    "gamebarftserver.exe",
+    "amdow.exe",
+    "amdrsserv.exe",
+    "action.exe",
+    "bandicam.exe",
+    "bdcam.exe",
+    "fraps.exe",
+    "dxtory.exe",
+    "camtasia.exe",
+    "camrecorder.exe",
+    "snagit32.exe",
+    "snagiteditor.exe",
+    "lightshot.exe",
+    "greenshot.exe",
+    "flameshot.exe",
+    "picpick.exe",
+    "screenclippinghost.exe",
+    "snippingtool.exe",
+    "screensketch.exe",
+    "loom.exe",
+    "overwolf.exe",
+    "outplayed.exe",
+    "steelseriesgg.exe",
+    "steelseriesengine.exe",
+    "rtss.exe",
+    "msiafterburner.exe",
 ];
+
+/// Words in a program's description that mark it as a capture/screenshot
+/// tool rather than a game.
+const CAPTURE_TOOL_WORDS: &[&str] = &[
+    "screen capture",
+    "screen recorder",
+    "screen recording",
+    "screenshot",
+    "screen shot",
+    "snipping",
+    "game recorder",
+    "gameplay recorder",
+    "broadcaster",
+    "streaming software",
+    "clip recorder",
+];
+
+/// Whether a program describes itself as capture/streaming software.
+pub fn is_capture_tool(display_name: Option<&str>) -> bool {
+    display_name.is_some_and(|n| {
+        let n = n.to_ascii_lowercase();
+        CAPTURE_TOOL_WORDS.iter().any(|w| n.contains(w))
+    })
+}
 
 /// Path fragments that strongly suggest a game install.
 const GAME_PATHS: &[&str] = &[
@@ -136,6 +200,7 @@ pub fn classify(facts: &ProcessFacts, cfg: &GameSettings) -> Verdict {
     if !cfg.auto_detect
         || cfg.excluded.iter().any(|e| e.eq_ignore_ascii_case(&exe))
         || NOT_GAMES.contains(&exe.as_str())
+        || is_capture_tool(facts.display_name.as_deref())
     {
         return Verdict::NotAGame;
     }
@@ -292,6 +357,21 @@ mod tests {
         assert_eq!(display_name(&f, &cfg), "Fortnite");
         f.is_foreground = false;
         assert_eq!(classify(&f, &cfg), Verdict::NotAGame);
+    }
+
+    #[test]
+    fn capture_tools_are_never_games() {
+        let cfg = GameSettings::default();
+        // ShareX's region picker is a fullscreen D3D window in the foreground.
+        let f = facts("ShareX.exe", r"C:\Program Files\ShareX\ShareX.exe");
+        assert_eq!(classify(&f, &cfg), Verdict::NotAGame);
+        let mut f = facts("recorder.exe", r"D:\Games\tools\recorder.exe");
+        f.display_name = Some("Awesome Screen Recorder Pro".into());
+        assert_eq!(classify(&f, &cfg), Verdict::NotAGame);
+        assert!(is_capture_tool(Some(
+            "ShareX - Screen capture, file sharing"
+        )));
+        assert!(!is_capture_tool(Some("Counter-Strike 2")));
     }
 
     #[test]

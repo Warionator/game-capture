@@ -7,7 +7,7 @@ use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use gc_audio::TrackLevel;
 use gc_core::config::{BufferStorage, Settings};
 use gc_core::ffmpeg::{
-    encoder_name, Backend, FfmpegCaps, Output, PipelineSpec, RemuxSpec, VideoSource,
+    encoder_name, Backend, FfmpegCaps, FocusScreen, Output, PipelineSpec, RemuxSpec, VideoSource,
 };
 use gc_core::metadata::{Bookmark, ClipMetadata, MediaKind, SCHEMA_VERSION};
 use gc_core::naming;
@@ -66,6 +66,10 @@ pub struct EngineStatus {
     pub ffmpeg_found: bool,
     pub pending_restart: bool,
     pub encoders_probed: bool,
+    /// "Game window", "Monitor"… while capturing.
+    pub capture_source: Option<String>,
+    /// The "Game not in focus" screen is being recorded right now.
+    pub focus_lost: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -125,6 +129,8 @@ impl CaptureEngine {
             ffmpeg_found: paths.ffmpeg.is_some(),
             pending_restart: false,
             encoders_probed: false,
+            capture_source: None,
+            focus_lost: false,
         }));
         let pipeline: Arc<Mutex<Option<Pipeline>>> = Arc::default();
         let probe: Probe = Arc::default();
@@ -145,6 +151,8 @@ impl CaptureEngine {
             next_restart: None,
             current_encoder: None,
             shutting_down: false,
+            degraded: false,
+            capture_label: None,
         };
         let thread = std::thread::Builder::new()
             .name("gc-capture-engine".into())
@@ -252,12 +260,19 @@ struct Worker {
     /// During shutdown sessions are finalised synchronously so the process
     /// does not exit mid-remux.
     shutting_down: bool,
+    /// Window capture / focus screen stalled once for this game: use the
+    /// plain monitor capture until the game changes.
+    degraded: bool,
+    capture_label: Option<&'static str>,
 }
 
 struct Target {
     video: VideoSource,
     size: (u32, u32),
     shot: Option<ShotTarget>,
+    label: &'static str,
+    /// The focus screen makes sense (a game is being captured).
+    focus_ok: bool,
 }
 
 impl Worker {
@@ -335,6 +350,7 @@ impl Worker {
                 if !changed {
                     return;
                 }
+                self.degraded = false;
                 if self.is_recording() {
                     if self.game.is_none() {
                         // Game closed: finish the session with it.
@@ -401,6 +417,7 @@ impl Worker {
         if let Some(p) = self.pipeline.lock().as_ref() {
             for t in s.audio.input_tracks() {
                 p.set_volume(&t.title, t.volume, t.muted);
+                p.set_gate(&t.title, t.gate_db);
             }
         }
         self.settings = *s;
@@ -418,6 +435,16 @@ impl Worker {
         let dead = {
             let mut guard = self.pipeline.lock();
             match guard.as_mut() {
+                Some(p) if p.shared.stalled(Duration::from_secs(8)) => {
+                    // Running but producing nothing (typically a window that
+                    // can't be captured): retry with plain monitor capture.
+                    if p.spec.focus_screen.is_some()
+                        || matches!(p.spec.video, VideoSource::Window { .. })
+                    {
+                        self.degraded = true;
+                    }
+                    Some(format!("no video for 8 s. {}", p.shared.stderr_summary()))
+                }
                 Some(p) => (!p.is_running()).then(|| p.shared.stderr_summary()),
                 None => None,
             }
@@ -437,23 +464,51 @@ impl Worker {
         }
     }
 
-    fn resolve_target(&self) -> Target {
+    /// Capture sources to try, best first: the game window itself (Windows
+    /// Graphics Capture), then the monitor it is on, then (dev hosts) a test
+    /// pattern.
+    fn resolve_targets(&self, caps: &FfmpegCaps) -> Vec<Target> {
+        let mut out = Vec::new();
         #[cfg(windows)]
         {
-            use gc_platform::display::{list_monitors, window_placement};
+            use gc_core::config::CaptureMode;
+            use gc_platform::display::{list_monitors, window_client_size, window_placement};
             use gc_platform::process::main_window;
             let draw_mouse = self.settings.video.capture_cursor;
             if let Some(g) = &self.game {
-                if let Some(pl) = g
-                    .hwnd
-                    .or_else(|| main_window(g.pid))
-                    .and_then(window_placement)
+                let hwnd = g.hwnd.or_else(|| main_window(g.pid));
+                let placement = hwnd.and_then(window_placement);
+                let shot = placement.as_ref().map(|pl| ShotTarget {
+                    adapter_idx: pl.monitor.adapter_idx,
+                    output_idx: pl.monitor.output_idx,
+                    region: (!pl.fullscreen).then_some(pl.rect),
+                });
+                if self.settings.video.capture_mode == CaptureMode::Window
+                    && !self.degraded
+                    && caps.has_filter("gfxcapture")
                 {
+                    if let Some((h, (w, ht))) =
+                        hwnd.and_then(|h| window_client_size(h).map(|s| (h, s)))
+                    {
+                        out.push(Target {
+                            video: VideoSource::Window {
+                                hwnd: h as u64,
+                                draw_mouse,
+                                adapter_idx: None,
+                            },
+                            size: (w & !1, ht & !1),
+                            shot,
+                            label: "Game window",
+                            focus_ok: true,
+                        });
+                    }
+                }
+                if let Some(pl) = placement {
                     let region = (!pl.fullscreen).then_some(pl.rect);
                     let size = region
                         .map(|r| (r.2, r.3))
                         .unwrap_or((pl.monitor.width, pl.monitor.height));
-                    return Target {
+                    out.push(Target {
                         video: VideoSource::Ddagrab {
                             adapter_idx: (pl.monitor.adapter_idx != 0)
                                 .then_some(pl.monitor.adapter_idx),
@@ -462,12 +517,11 @@ impl Worker {
                             region,
                         },
                         size,
-                        shot: Some(ShotTarget {
-                            adapter_idx: pl.monitor.adapter_idx,
-                            output_idx: pl.monitor.output_idx,
-                            region,
-                        }),
-                    };
+                        shot,
+                        label: "Monitor",
+                        focus_ok: true,
+                    });
+                    return out;
                 }
             }
             let monitors = list_monitors();
@@ -476,7 +530,7 @@ impl Worker {
                 .or_else(|| monitors.iter().find(|m| m.primary))
                 .or(monitors.first());
             if let Some(m) = m {
-                return Target {
+                out.push(Target {
                     video: VideoSource::Ddagrab {
                         adapter_idx: (m.adapter_idx != 0).then_some(m.adapter_idx),
                         output_idx: m.output_idx,
@@ -489,15 +543,42 @@ impl Worker {
                         output_idx: m.output_idx,
                         region: None,
                     }),
-                };
+                    label: "Monitor",
+                    focus_ok: self.game.is_some(),
+                });
+                return out;
             }
         }
+        let _ = caps;
         // Development hosts without Desktop Duplication: synthetic video.
-        Target {
+        out.push(Target {
             video: VideoSource::TestPattern,
             size: (1280, 720),
             shot: None,
+            label: "Test pattern",
+            focus_ok: false,
+        });
+        out
+    }
+
+    /// The screenshot target for the current game/monitor.
+    fn shot_target(&self) -> Option<ShotTarget> {
+        self.resolve_targets(&FfmpegCaps::default())
+            .into_iter()
+            .find_map(|t| t.shot)
+    }
+
+    /// TTF used for the focus screen caption (`None` = plain screen).
+    fn focus_font(caps: &FfmpegCaps) -> Option<String> {
+        if !caps.has_filter("drawtext") {
+            return None;
         }
+        let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+        ["segoeui.ttf", "arial.ttf"]
+            .iter()
+            .map(|f| std::path::Path::new(&windir).join("Fonts").join(f))
+            .find(|p| p.exists())
+            .map(|p| p.to_string_lossy().into_owned())
     }
 
     fn start_pipeline(&mut self) {
@@ -517,13 +598,17 @@ impl Worker {
 
         let s = self.settings.clone();
         let temp_dir = self.temp_dir.clone();
-        let target = self.resolve_target();
+        let targets = self.resolve_targets(&caps);
+        let font = Self::focus_font(&caps);
         let layout = s.audio.track_layout();
         let audio = AudioPlan {
             layout,
             game_pid: self.game.as_ref().map(|g| g.pid),
             mic_device: s.audio.mic.device_id.clone(),
-            system_fallback: s.audio.system_audio_fallback,
+            system_fallback: s
+                .audio
+                .system_audio_fallback
+                .unwrap_or(!gc_platform::system::supports_process_loopback()),
         };
         let replay_secs = if s.replay.enabled {
             s.replay.duration_secs
@@ -551,65 +636,83 @@ impl Worker {
 
         let mut errors = Vec::new();
         let order = choose_backends(s.video.encoder, s.video.codec, &probed);
+        let game_pid = self.game.as_ref().map(|g| g.pid);
         for &(backend, codec) in &order {
-            let variants: &[bool] = if s.video.zero_copy && backend.is_hardware() {
+            let zc_variants: &[bool] = if s.video.zero_copy && backend.is_hardware() {
                 &[true, false]
             } else {
                 &[false]
             };
-            for &zero_copy in variants {
-                let spec = PipelineSpec {
-                    video: target.video.clone(),
-                    source_size: target.size,
-                    fps: s.video.fps,
-                    resolution: s.video.resolution,
-                    backend,
-                    codec,
-                    rate: s.video.rate_control,
-                    zero_copy,
-                    gpu_scaler: caps.gpu_scaler(backend),
-                    audio: Vec::new(),
-                    mixdown: s.audio.mixdown_enabled,
-                    audio_bitrate_kbps: 160,
-                    output: Output::StdoutTs,
-                };
-                if zero_copy && !spec.is_zero_copy() {
-                    continue; // identical to the download variant
-                }
-                let started = Pipeline::start(&ff, spec, &audio, ring_plan()).and_then(|mut p| {
-                    p.wait_healthy(Duration::from_secs(8))?;
-                    Ok(p)
-                });
-                match started {
-                    Ok(p) => {
-                        let zc = p.spec.is_zero_copy();
-                        log::info!(
-                            "capture running: {} {} ({}), zero-copy: {zc}",
-                            encoder_name(backend, codec),
-                            target.size.0,
-                            target.size.1
-                        );
-                        if (backend, codec) != order[0]
-                            && self.current_encoder != Some((backend, codec))
-                        {
-                            self.notice(
-                                false,
-                                format!("Using fallback encoder {}", encoder_name(backend, codec)),
-                            );
+            for &zero_copy in zc_variants {
+                for target in &targets {
+                    let focus_variants: &[bool] = if s.video.focus_screen
+                        && target.focus_ok
+                        && !self.degraded
+                        && game_pid.is_some()
+                    {
+                        &[true, false]
+                    } else {
+                        &[false]
+                    };
+                    for &focus in focus_variants {
+                        let spec = PipelineSpec {
+                            video: target.video.clone(),
+                            source_size: target.size,
+                            fps: s.video.fps,
+                            resolution: s.video.resolution,
+                            backend,
+                            codec,
+                            rate: s.video.rate_control,
+                            zero_copy,
+                            gpu_scaler: caps.gpu_scaler(backend),
+                            has_scale_d3d11: caps.has_filter("scale_d3d11"),
+                            focus_screen: focus.then(|| FocusScreen {
+                                font_file: font.clone(),
+                            }),
+                            audio: Vec::new(),
+                            mixdown: s.audio.mixdown_enabled,
+                            audio_bitrate_kbps: 160,
+                            output: Output::StdoutTs,
+                        };
+                        if zero_copy && !spec.is_zero_copy() {
+                            continue; // identical to the download variant
                         }
-                        self.current_encoder = Some((backend, codec));
-                        *self.pipeline.lock() = Some(p);
-                        self.last_error = None;
-                        self.restart_backoff = Duration::from_secs(2);
-                        self.next_restart = None;
-                        return;
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "{} (zero-copy {zero_copy}) failed: {e}",
-                            encoder_name(backend, codec)
-                        );
-                        errors.push(format!("{}: {e}", encoder_name(backend, codec)));
+                        let started = Pipeline::start(&ff, spec, &audio, ring_plan(), game_pid)
+                            .and_then(|mut p| {
+                                p.wait_healthy(Duration::from_secs(8))?;
+                                Ok(p)
+                            });
+                        let name = encoder_name(backend, codec);
+                        match started {
+                            Ok(p) => {
+                                log::info!(
+                                    "capture running: {name} from {} {}x{}, zero-copy: {}, focus screen: {focus}",
+                                    target.label,
+                                    target.size.0,
+                                    target.size.1,
+                                    p.spec.is_zero_copy()
+                                );
+                                if (backend, codec) != order[0]
+                                    && self.current_encoder != Some((backend, codec))
+                                {
+                                    self.notice(false, format!("Using fallback encoder {name}"));
+                                }
+                                self.current_encoder = Some((backend, codec));
+                                self.capture_label = Some(target.label);
+                                *self.pipeline.lock() = Some(p);
+                                self.last_error = None;
+                                self.restart_backoff = Duration::from_secs(2);
+                                self.next_restart = None;
+                                return;
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "{name} from {} (zero-copy {zero_copy}, focus {focus}) failed: {e}",
+                                    target.label
+                                );
+                                errors.push(format!("{name}: {e}"));
+                            }
+                        }
                     }
                 }
             }
@@ -864,8 +967,7 @@ impl Worker {
     }
 
     fn screenshot(&mut self) {
-        let target = self.resolve_target();
-        let Some(shot) = target.shot else {
+        let Some(shot) = self.shot_target() else {
             self.notice(true, "Screenshots need Windows Desktop Duplication");
             return;
         };
@@ -929,6 +1031,8 @@ impl Worker {
                     ));
                     s.zero_copy = p.spec.is_zero_copy();
                     s.output_size = Some(p.spec.output_size());
+                    s.capture_source = self.capture_label.map(String::from);
+                    s.focus_lost = p.focus_lost();
                 }
                 None => {
                     s.recording_secs = 0.0;
@@ -937,6 +1041,8 @@ impl Worker {
                     s.encoder_label = None;
                     s.zero_copy = false;
                     s.output_size = None;
+                    s.capture_source = None;
+                    s.focus_lost = false;
                     s.state = if self.paused {
                         CaptureState::Paused
                     } else if self.last_error.is_some() && self.wants_pipeline() {

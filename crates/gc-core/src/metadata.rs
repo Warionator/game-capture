@@ -153,7 +153,8 @@ impl ClipMetadata {
     }
 
     /// FFmpeg `ffmetadata` document with one chapter per bookmark, so players
-    /// show bookmarks as chapter marks.
+    /// show bookmarks as chapter marks. MP4 chapters are contiguous from 0, so
+    /// a "Start" chapter covers the part before the first bookmark.
     pub fn ffmetadata_chapters(&self) -> String {
         let mut out = String::from(";FFMETADATA1\n");
         let escape = |s: &str| {
@@ -166,6 +167,12 @@ impl ClipMetadata {
         };
         let mut marks = self.bookmarks.clone();
         marks.sort_by_key(|b| b.offset_ms);
+        if let Some(first) = marks.first().filter(|b| b.offset_ms > 0) {
+            out.push_str(&format!(
+                "[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND={}\ntitle=Start\n",
+                first.offset_ms
+            ));
+        }
         for (i, b) in marks.iter().enumerate() {
             let end = marks
                 .get(i + 1)
@@ -240,6 +247,7 @@ mod tests {
     #[test]
     fn chapters_are_sorted_and_escaped() {
         let doc = sample().ffmetadata_chapters();
+        assert!(doc.contains("START=0\nEND=12000\ntitle=Start"));
         let first = doc.find("START=12000").unwrap();
         let second = doc.find("START=60000").unwrap();
         assert!(first < second);
