@@ -5,7 +5,7 @@
   "license": "GPL-3.0-or-later",
   "description": "Lightweight game clipping and recording for Windows",
   "scripts": {
-    "postinstall": "npm --prefix ui install",
+    "postinstall": "cd ui && npm install",
     "dev": "tauri dev",
     "ui": "npm --prefix ui run dev",
     "build": "tauri build --config src-tauri/tauri.bundle.conf.json",

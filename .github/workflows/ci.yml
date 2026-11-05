@@ -82,8 +82,11 @@ jobs:
       - name: Fetch FFmpeg
         shell: pwsh
         run: ./scripts/fetch-ffmpeg.ps1
-      - name: Install JS dependencies
+      - name: Install JS dependencies (Tauri CLI)
+        run: npm ci --ignore-scripts
+      - name: Install JS dependencies (UI)
         run: npm ci
+        working-directory: ui
       - name: Build frontend
         run: npm run build
         working-directory: ui
