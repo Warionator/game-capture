@@ -29,28 +29,6 @@ per process with the WASAPI process-loopback API.
 | Player & editor | Single click opens the player (fullscreen with F): bookmark timeline, Master mix by default, or the individual tracks with their own volume/mute (pre-extracted, so switching is instant). Crop with the handles or Start/End crop buttons — playback stays inside the crop; save over the original or as a copy, or "+ Clip" a moment out of a long session into a new clip (lossless video copy). |
 | System | Optional *Disable Windows Game Mode* (`HKCU\Software\Microsoft\GameBar`), start with Windows (`HKCU\…\Run`, `--minimized`), tray icon with Pause / Save Replay / Dashboard / Settings / Quit. |
 
-## Repository layout
-
-```
-crates/
-  gc-core      Platform-independent logic: settings, naming, hotkey parsing,
-               FFmpeg argument construction, MPEG-TS chunker, replay ring,
-               metadata model, game-detection heuristics. Fully unit-tested.
-  gc-library   SQLite index + self-healing scanner + thumbnails.
-  gc-platform  Windows: process watcher, icons, keyboard hook, registry,
-               Explorer/clipboard helpers, DXGI monitor enumeration.
-  gc-audio     WASAPI process/system loopback + microphone, clock-driven
-               mixer, named-pipe delivery to FFmpeg.
-  gc-capture   Capture engine: FFmpeg process, encoder probing & fallback,
-               replay save, session recording, screenshots.
-src-tauri/     Tauri v2 shell: commands, tray, event wiring.
-ui/            React 19 + Tailwind v4 frontend (runs standalone with a mock
-               backend via `npm --prefix ui run dev`).
-docs/          Architecture notes.
-scripts/       FFmpeg download helper.
-```
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together.
 
 ## Building (Windows)
 
