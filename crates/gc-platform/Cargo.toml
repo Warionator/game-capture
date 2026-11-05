@@ -4,6 +4,7 @@ description = "Windows integration for game-capture: process watcher & icon extr
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 gc-core.workspace = true

@@ -76,6 +76,16 @@ metadata and chapters → ffprobe). The Windows code is type-checked with
 - **Preview player**: uses WebView2's decoders. HEVC/AV1 need the matching
   Microsoft Store video extensions; anything else can be opened in the default
   external player from the context menu.
-- **FFmpeg licensing**: the fetch script downloads GPL builds (x264/x265).
-  Redistributing installers that bundle them means complying with the GPL;
-  use an LGPL build if that is a concern (hardware encoders still work).
+- **FFmpeg licensing**: the fetch script downloads GPL builds (x264/x265),
+  which are compatible with this project's GPL-3.0 licence.
+
+## License
+
+game-capture is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See [LICENSE](LICENSE).
+
+The bundled FFmpeg is the GPL build from
+[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds) and keeps its own
+licence (`binaries/FFMPEG-LICENSE.txt` in the release zip).

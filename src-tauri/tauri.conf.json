@@ -53,6 +53,7 @@
     "longDescription": "Replay buffer clipping, session recording, per-application audio tracks and a local media library for Windows games.",
     "category": "Video",
     "publisher": "game-capture",
+    "license": "GPL-3.0-or-later",
     "windows": {
       "nsis": {
         "installMode": "currentUser"

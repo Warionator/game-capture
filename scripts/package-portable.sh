@@ -44,6 +44,7 @@ FF="$(find "$TMP" -maxdepth 1 -type d -name 'ffmpeg-*' | head -1)"
 cp "$FF"/bin/ffmpeg.exe "$FF"/bin/ffprobe.exe "$FF"/bin/*.dll "$STAGE/binaries/"
 cp "$FF/LICENSE.txt" "$STAGE/binaries/FFMPEG-LICENSE.txt"
 cp "$ROOT/scripts/TESTING.txt" "$STAGE/TESTING.txt"
+cp "$ROOT/LICENSE" "$STAGE/LICENSE.txt"
 
 (cd "$OUT" && rm -f "$NAME.zip" && zip -q -r -9 "$NAME.zip" "$NAME")
 echo "==> $OUT/$NAME.zip"
