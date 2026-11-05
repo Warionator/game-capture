@@ -1,4 +1,4 @@
-game-capture 1.0.0 - portable build (Windows 10/11 x64)
+game-capture 1.1.0 - portable build (Windows 10/11 x64)
 
 RUN
   1. Extract the whole folder somewhere permanent (e.g. C:\Tools\game-capture).
@@ -74,6 +74,11 @@ SUGGESTED TEST PASS
   [ ] Right-click a clip: Open file location / Copy to clipboard (paste in
       Explorer or Discord) / Details / Delete.
   [ ] Close the window -> app stays in the tray; tray menu Pause/Quit work.
+  [ ] Settings > About > Updates: "Check now" says you're on the latest
+      version, or (when a newer release exists) this portable copy shows a
+      banner at the top with Download, which opens the release page. The
+      installed version downloads the update instead and offers "Restart to
+      update".
   [ ] Settings > General: change the library folder -> the gallery shows only
       that folder. "Additional folders" > Add folder (e.g. D:\Medal) -> its
       clips appear; remove it -> they disappear (files are left alone).

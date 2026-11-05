@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "game-capture",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "identifier": "GameCapture",
   "build": {
     "beforeDevCommand": {
@@ -57,6 +57,18 @@
     "windows": {
       "nsis": {
         "installMode": "currentUser"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDBCQ0UxOUU1MEJDMDc5NEIKUldSTGVjQUw1Um5PQ3lhNzRJbnc5TFF3R3VtcktlYzZtOFBmZVlmWFNGR0crNWdSb0NsWHZtcjgK",
+      "endpoints": [
+        "https://github.com/Warionator/game-capture/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true,
+      "windows": {
+        "installMode": "passive"
       }
     }
   }

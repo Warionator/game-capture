@@ -837,6 +837,8 @@ pub struct SystemSettings {
     /// Closing the window hides it to the tray instead of quitting.
     pub close_to_tray: bool,
     pub show_notifications: bool,
+    /// Look for new versions on startup and every few hours.
+    pub check_for_updates: bool,
 }
 
 impl Default for SystemSettings {
@@ -846,6 +848,7 @@ impl Default for SystemSettings {
             autostart: true,
             close_to_tray: true,
             show_notifications: true,
+            check_for_updates: true,
         }
     }
 }

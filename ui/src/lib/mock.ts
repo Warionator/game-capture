@@ -7,6 +7,7 @@ import type {
   MediaItem,
   Settings,
   TrackLevel,
+  UpdateInfo,
 } from "./types";
 
 type Handler = (payload: unknown) => void;
@@ -18,6 +19,42 @@ function emit(event: string, payload: unknown) {
 
 // Dev hook: lets UI checks push backend events (e.g. overlay popups).
 (globalThis as { __gcMockEmit?: typeof emit }).__gcMockEmit = emit;
+
+// Update simulation for UI review: `?update=installer` downloads 1.1.1 and
+// shows "Restart to update"; `?update=portable` only announces it. Without
+// the parameter every check reports "up to date".
+const mockUpdate = new URLSearchParams(globalThis.location?.search ?? "").get("update");
+let updateInfo: UpdateInfo = {
+  kind: mockUpdate === "portable" ? "portable" : "installer",
+  currentVersion: "1.1.0",
+  phase: { state: "idle" },
+  lastCheckedMs: null,
+};
+function setUpdate(phase: UpdateInfo["phase"], checked = false) {
+  updateInfo = { ...updateInfo, phase, lastCheckedMs: checked ? Date.now() : updateInfo.lastCheckedMs };
+  emit("update", updateInfo);
+}
+async function mockCheck(): Promise<UpdateInfo> {
+  setUpdate({ state: "checking" });
+  await new Promise((r) => setTimeout(r, 600));
+  if (!mockUpdate) {
+    setUpdate({ state: "upToDate" }, true);
+    return updateInfo;
+  }
+  const version = "1.1.1";
+  const notes = "Fixes and improvements.";
+  if (updateInfo.kind === "portable") {
+    setUpdate({ state: "available", version, notes, url: "https://example.invalid/releases/tag/v1.1.1" }, true);
+    return updateInfo;
+  }
+  for (let p = 0; p <= 100; p += 20) {
+    setUpdate({ state: "downloading", version, percent: p });
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  setUpdate({ state: "ready", version, notes }, true);
+  return updateInfo;
+}
+if (mockUpdate) setTimeout(() => void mockCheck(), 800);
 
 const HOUR = 3_600_000;
 const now = Date.now();
@@ -125,7 +162,7 @@ let settings: Settings = {
   },
   hotkeys: { saveReplay: "Alt+F10", toggleRecording: "Alt+F9", addBookmark: "Alt+F8", screenshot: "Alt+F12" },
   screenshot: { format: "png", jpegQuality: 92 },
-  system: { disableGameMode: true, autostart: true, closeToTray: true, showNotifications: true },
+  system: { disableGameMode: true, autostart: true, closeToTray: true, showNotifications: true, checkForUpdates: true },
   games: {
     autoDetect: true,
     custom: [{ displayName: "Dolphin (GameCube)", executable: "Dolphin.exe", path: "C:\\Emulators\\Dolphin\\Dolphin.exe" }],
@@ -348,8 +385,18 @@ const handlers: Record<string, (a: Record<string, unknown>) => unknown> = {
     }
     emit("status", status);
   },
+  update_status: () => updateInfo,
+  check_for_updates: () => mockCheck(),
+  install_update: () => {
+    // The real app exits here and the installer restarts it.
+    updateInfo = { ...updateInfo, currentVersion: "1.1.1" };
+    setUpdate({ state: "upToDate" }, true);
+  },
+  open_release_page: () => {
+    notice("Opening the release page in your browser");
+  },
   system_info: () => ({
-    version: "1.0.0",
+    version: "1.1.0",
     windowsBuild: 22631,
     processLoopback: true,
     gameModeEnabled: false,

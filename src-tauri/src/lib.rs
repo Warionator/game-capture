@@ -5,6 +5,7 @@ mod logger;
 mod overlay;
 mod state;
 mod tray;
+mod update;
 
 use state::AppState;
 use std::sync::Arc;
@@ -25,10 +26,12 @@ pub fn run() {
             show_main(app)
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(overlay::OverlayState::default())
         .setup(move |app| {
             state::init(app.handle(), minimized).map_err(|e| e.to_string())?;
             tray::create(app.handle())?;
+            update::init(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -76,6 +79,10 @@ pub fn run() {
             commands::system_info,
             commands::overlay_ready,
             commands::preview_overlay,
+            commands::update_status,
+            commands::check_for_updates,
+            commands::install_update,
+            commands::open_release_page,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the tauri application")
@@ -92,15 +99,7 @@ pub fn run() {
                     api.prevent_exit();
                 }
             }
-            RunEvent::Exit => {
-                if let Some(state) = app.try_state::<Arc<AppState>>() {
-                    // Stops capture and finalises an active recording.
-                    drop(state.engine.lock().take());
-                    drop(state.hook.lock().take());
-                    drop(state.watcher.lock().take());
-                }
-                log::logger().flush();
-            }
+            RunEvent::Exit => state::shutdown(app),
             _ => {}
         });
 }

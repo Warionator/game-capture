@@ -1,10 +1,13 @@
-**game-capture 1.0**: lightweight game clipping and recording for Windows 10/11.
+**game-capture 1.1**: lightweight game clipping and recording for Windows 10/11.
 
 > Tested with unit tests and end-to-end tests against real FFmpeg; the Windows-specific parts have had limited testing on real hardware so far. Please report anything odd; the log file location is below.
 
 ## Download & run
-1. Download `game-capture-1.0.0-windows-x64.zip` below and extract the whole folder somewhere permanent. Keep the `binaries` folder next to the exe.
-2. Run `game-capture.exe`. The build is unsigned, so SmartScreen may warn: choose **More info → Run anyway**.
+Get the latest version from [Releases](../../releases/latest). Pick one:
+- **Installer** (`game-capture_<version>_x64-setup.exe`): installs for your user only (no admin needed) and updates itself.
+- **Portable** (`game-capture-<version>-windows-x64.zip`): extract the whole folder somewhere permanent and run `game-capture.exe`. Keep the `binaries` folder next to the exe. It tells you when a new version is out; you download it yourself.
+
+Neither has a Windows code-signing certificate, so SmartScreen may warn: choose **More info → Run anyway**.
 
 On first launch it disables Windows Game Mode and registers itself to start with Windows (both on by default; turn them off under Settings → System).
 
@@ -18,13 +21,13 @@ On first launch it disables Windows Game Mode and registers itself to start with
 - **Library:** `<library>/<Game>/<date>_<Clip|Session|Screenshot>.<ext>`, with metadata embedded in each file and a self-healing index. Filters, multi-select delete, and extra folders (e.g. Medal) on request.
 - **Player and editor:** combined or per-track audio, crop with handles or Start/End crop, save over the original or as a copy, "+ Clip" from long sessions, fullscreen.
 - **Desktop capture is off by default:** nothing is captured outside games unless you enable it.
+- **Automatic updates:** the installed version downloads signed updates in the background and shows a small banner; click **Restart to update** when it suits you. Settings → About has a "Check now" button and an on/off switch.
 
 ## Known limitations
 - Exclusive-fullscreen games draw over every window, so popups only show in borderless/windowed mode.
 - Games running as administrator need game-capture run as administrator for hotkeys to work.
 - Installed web apps share their browser's audio process, so a web-app track also records other tabs in that browser.
 - Per-app audio needs Windows 10 2004 (build 19041) or newer.
-- This zip is built with the GNU toolchain. The CI pipeline builds an MSVC-toolchain NSIS installer as a workflow artifact.
 
 ## Logs
 `%LOCALAPPDATA%\GameCapture\logs\game-capture.log`

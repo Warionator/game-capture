@@ -31,3 +31,4 @@ base64.workspace = true
 tauri = { version = "2", features = ["tray-icon", "protocol-asset", "image-png"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"

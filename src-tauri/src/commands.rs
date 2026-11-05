@@ -425,3 +425,25 @@ pub fn system_info(state: St) -> SystemInfo {
         platform: std::env::consts::OS,
     }
 }
+
+// --- updates -------------------------------------------------------------
+
+#[tauri::command]
+pub fn update_status(app: AppHandle) -> crate::update::UpdateInfo {
+    crate::update::info(&app)
+}
+
+#[tauri::command]
+pub async fn check_for_updates(app: AppHandle) -> crate::update::UpdateInfo {
+    crate::update::check(&app).await
+}
+
+#[tauri::command]
+pub fn install_update(app: AppHandle) -> CmdResult<()> {
+    crate::update::install(&app)
+}
+
+#[tauri::command]
+pub fn open_release_page(app: AppHandle) -> CmdResult<()> {
+    crate::update::open_release_page(&app)
+}

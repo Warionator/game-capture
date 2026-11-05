@@ -20,6 +20,7 @@ import type {
   SystemInfo,
   TrackFile,
   TrackLevel,
+  UpdateInfo,
   WindowedProcess,
 } from "./types";
 import { mock } from "./mock";
@@ -65,6 +66,11 @@ export const api = {
   systemInfo: () => call<SystemInfo>("system_info"),
   overlayReady: () => call<void>("overlay_ready"),
   previewOverlay: () => call<void>("preview_overlay"),
+  updateStatus: () => call<UpdateInfo>("update_status"),
+  checkForUpdates: () => call<UpdateInfo>("check_for_updates"),
+  /** Runs the downloaded installer; the app exits and restarts updated. */
+  installUpdate: () => call<void>("install_update"),
+  openReleasePage: () => call<void>("open_release_page"),
 };
 
 export interface EventMap {
@@ -75,6 +81,7 @@ export interface EventMap {
   "scan-progress": boolean;
   navigate: string;
   game: unknown;
+  update: UpdateInfo;
   "overlay-toast": { toast: import("./types").OverlayToast; corner: import("./types").OverlayPosition };
 }
 

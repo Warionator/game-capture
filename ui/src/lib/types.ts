@@ -114,6 +114,7 @@ export interface Settings {
     autostart: boolean;
     closeToTray: boolean;
     showNotifications: boolean;
+    checkForUpdates: boolean;
   };
   games: { autoDetect: boolean; custom: CustomGame[]; excluded: string[] };
   recording: { autoRecordSessions: boolean };
@@ -305,3 +306,22 @@ export type Action =
   | "stopCapture"
   | "pause"
   | "resume";
+
+/** "installer": updates download and install; "portable": announced only. */
+export type InstallKind = "installer" | "portable";
+
+export type UpdatePhase =
+  | { state: "idle" }
+  | { state: "checking" }
+  | { state: "upToDate" }
+  | { state: "downloading"; version: string; percent: number | null }
+  | { state: "ready"; version: string; notes: string | null }
+  | { state: "available"; version: string; notes: string | null; url: string }
+  | { state: "error"; message: string };
+
+export interface UpdateInfo {
+  kind: InstallKind;
+  currentVersion: string;
+  phase: UpdatePhase;
+  lastCheckedMs: number | null;
+}

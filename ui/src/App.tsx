@@ -4,6 +4,7 @@ import { Sidebar, type View } from "./components/Sidebar";
 import { StatusBar } from "./components/StatusBar";
 import { ConfirmHost } from "./components/ConfirmHost";
 import { Toasts } from "./components/Toasts";
+import { UpdateBanner } from "./components/UpdateBanner";
 import { api, on } from "./lib/api";
 import { StoreProvider, useStore } from "./lib/store";
 import type { GameSummary } from "./lib/types";
@@ -29,6 +30,7 @@ function Shell() {
     <div className="flex h-full">
       <Sidebar view={view} setView={setView} games={games} selectedGame={game} setSelectedGame={setGame} />
       <main className="flex min-w-0 flex-1 flex-col">
+        <UpdateBanner />
         <StatusBar />
         {view === "library" ? <Gallery game={game} onLibraryChanged={loadGames} /> : <SettingsPage />}
       </main>

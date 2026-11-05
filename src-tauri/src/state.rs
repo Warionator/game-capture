@@ -41,6 +41,17 @@ impl AppState {
     }
 }
 
+/// Stops capture (finalising an active recording), hotkeys and the process
+/// watcher. Runs on normal exit and before an update restarts the app.
+pub fn shutdown(app: &AppHandle) {
+    if let Some(state) = app.try_state::<Arc<AppState>>() {
+        drop(state.engine.lock().take());
+        drop(state.hook.lock().take());
+        drop(state.watcher.lock().take());
+    }
+    log::logger().flush();
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Notice {

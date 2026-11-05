@@ -12,6 +12,7 @@ pub mod metadata;
 pub mod naming;
 pub mod ring;
 pub mod ts;
+pub mod update;
 
 pub use config::Settings;
 pub use metadata::{Bookmark, ClipMetadata, MediaKind};

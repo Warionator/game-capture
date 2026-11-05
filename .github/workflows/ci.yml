@@ -135,15 +135,46 @@ jobs:
           path: target/release/bundle/nsis/*.exe
           if-no-files-found: error
 
-      - name: Zip for release
+      - name: Prepare release (zip, signed installer, update manifest)
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          Compress-Archive -Path "${{ steps.portable.outputs.stage }}" -DestinationPath "target/portable/${{ steps.portable.outputs.name }}.zip" -Force
+          $tag = "${{ github.ref_name }}"
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ($tag -ne "v$version") { throw "Tag $tag does not match the app version $version in Cargo.toml" }
           # Release notes live in docs/releases/<tag>.md; fail rather than
           # publish a release without them.
-          $notes = "docs/releases/${{ github.ref_name }}.md"
+          $notes = "docs/releases/$tag.md"
           if (-not (Test-Path $notes)) { throw "Missing release notes: $notes" }
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw "The TAURI_SIGNING_PRIVATE_KEY secret is not set; updates can't be signed" }
+
+          Compress-Archive -Path "${{ steps.portable.outputs.stage }}" -DestinationPath "target/portable/${{ steps.portable.outputs.name }}.zip" -Force
+
+          # Sign the installer for the updater. --app-version binds the version
+          # into the signature, which the app requires (requireSignedVersion).
+          $setupName = "game-capture_${version}_x64-setup.exe"
+          $setup = "target/release/bundle/nsis/$setupName"
+          if (-not (Test-Path $setup)) { throw "Installer not found: $setup" }
+          npx tauri signer sign --app-version $version $setup
+          if ($LASTEXITCODE -ne 0) { throw "Signing failed" }
+
+          # The app polls releases/latest/download/latest.json.
+          $manifest = [ordered]@{
+            version   = $version
+            notes     = "See https://github.com/${{ github.repository }}/releases/tag/$tag"
+            pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = (Get-Content "$setup.sig" -Raw).Trim()
+                url       = "https://github.com/${{ github.repository }}/releases/download/$tag/$setupName"
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM target/latest.json
+          Get-Content target/latest.json
       - name: Publish GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
@@ -154,4 +185,6 @@ jobs:
           files: |
             target/portable/${{ steps.portable.outputs.name }}.zip
             target/release/bundle/nsis/*.exe
+            target/release/bundle/nsis/*.exe.sig
+            target/latest.json
           fail_on_unmatched_files: true
