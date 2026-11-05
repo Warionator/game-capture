@@ -483,8 +483,25 @@ impl PipelineSpec {
             );
         }
 
+        // --- focus-screen keepalive input (index n, after the audio) -------
+        // FFmpeg 8 doesn't deliver runtime commands (`focus_command`) to a
+        // filter graph that has no inputs: every source here is a graph
+        // source, so without audio filters the switch was silently ignored.
+        // A silent, real-time-paced input that only feeds `anullsink` gives
+        // the graph a live input. It is never mapped to the output.
+        let keepalive = self.focus_screen.is_some().then_some(self.audio.len());
+        if keepalive.is_some() {
+            push(
+                &mut a,
+                &["-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono,arealtime"],
+            );
+        }
+
         // --- filter graph --------------------------------------------------
         let mut graph: Vec<String> = vec![self.video_graph(&video_src)];
+        if let Some(idx) = keepalive {
+            graph.push(format!("[{idx}:a]anullsink"));
+        }
         let video_map = "[v]".to_string();
 
         let mix_members: Vec<usize> = (0..self.audio.len())
@@ -1302,6 +1319,29 @@ mod tests {
         assert!(fc.starts_with(
             "ddagrab=output_idx=0:framerate=60:draw_mouse=0,hwdownload,format=bgra[cap];color=c=0x0b0d12:s=2560x1440:r=1,format=bgra[fs];[cap][fs]streamselect=inputs=2:map=0,fps=60,scale=1920:1080:flags=bicubic,format=yuv420p[v]"
         ), "{fc}");
+    }
+
+    #[test]
+    fn focus_screen_adds_keepalive_input_after_audio() {
+        let mut s = spec();
+        s.focus_screen = Some(FocusScreen { font_file: None });
+        let a = s.build_args();
+        let inputs: Vec<&str> = a
+            .windows(2)
+            .filter(|w| w[0] == "-i")
+            .map(|w| w[1].as_str())
+            .collect();
+        let n = s.audio.len();
+        // Audio keeps indices 0..n; the keepalive is input n and unmapped.
+        assert_eq!(inputs.len(), n + 1, "{inputs:?}");
+        assert_eq!(inputs[n], "anullsrc=r=8000:cl=mono,arealtime");
+        let fc = arg_after(&a, "-filter_complex").unwrap();
+        assert!(fc.contains(&format!(";[{n}:a]anullsink")), "{fc}");
+        assert!(!a.iter().any(|x| x == &format!("{n}:a")), "{a:?}");
+
+        s.focus_screen = None;
+        let a = s.build_args();
+        assert!(!a.iter().any(|x| x.contains("anullsrc")), "{a:?}");
     }
 
     #[test]
