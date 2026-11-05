@@ -1,91 +1,33 @@
-# game-capture
+**game-capture 1.0**: lightweight game clipping and recording for Windows 10/11.
 
-Lightweight, low-overhead game clipping and recording for Windows 10/11.
-Replay-buffer clips, long session recordings, per-application audio tracks
-and a local media library — no accounts, uploads, overlays or social features.
+> Tested with unit tests and end-to-end tests against real FFmpeg; the Windows-specific parts have had limited testing on real hardware so far. Please report anything odd; the log file location is below.
 
-Built with **Rust + Tauri v2** (small idle footprint) and a **React +
-Tailwind** UI. Video is captured with DXGI Desktop Duplication and encoded on
-the GPU (NVENC / AMF / QuickSync) through a bundled FFmpeg; audio is captured
-per process with the WASAPI process-loopback API.
+## Download & run
+1. Download `game-capture-1.0.0-windows-x64.zip` below and extract the whole folder somewhere permanent. Keep the `binaries` folder next to the exe.
+2. Run `game-capture.exe`. The build is unsigned, so SmartScreen may warn: choose **More info → Run anyway**.
 
-## Features
+On first launch it disables Windows Game Mode and registers itself to start with Windows (both on by default; turn them off under Settings → System).
 
-| Area | What it does |
-| --- | --- |
-| Game detection | Polls processes, inspects the foreground process for loaded D3D9/11/12, Vulkan or OpenGL modules, fullscreen windows, launcher install paths and Microsoft Store packages. Names come from version info / package manifests / install folders; icons are extracted to PNG. Manual override: pick a running window or browse for an `.exe`. |
-| Capture | Games are captured with **Windows Graphics Capture of the game window only** (`gfxcapture`), so other apps and notifications never appear; monitor capture (`ddagrab`, Desktop Duplication) is the fallback and an option. D3D11 textures go directly to the hardware encoder — no CPU pixel copies and **no API hooks / DLL injection**, so anti-cheat is not triggered. GPU-side scaling via `scale_d3d11` / `vpp_amf` / `scale_qsv`. |
-| Focus screen | While the game is not the foreground window, the recording switches (live, via `streamselect`) to a "Game not in focus" screen. |
-| Encoders | Probed at startup by encoding test frames: NVENC → AMF → QuickSync → software (x264 / x265 / SVT-AV1). H.264, HEVC and AV1. If a configuration fails to start, the engine retries without zero-copy and then with the next encoder. |
-| Audio | Track 1 master mix · Track 2 game (process tree only) · Track 3 microphone (device choice, adjustable noise suppression, live noise gate with threshold marker on the meter) · Track 4 Discord (by executable) · any number of extra app tracks. Live per-track gain, mute and peak meters. |
-| Replay buffer | 15 s – 20 min of keyframe-aligned MPEG-TS chunks kept in RAM, spilling to disk (ideally NVMe) when the window does not fit the RAM budget. Saving is a stream copy — no re-encode. |
-| Recording | Optional full-session recording (starts with the game, stops when it exits). Clips and recordings have independent quality settings: when they match, one GPU encode serves both; otherwise a second encoder runs only while recording. Written crash-safely as MPEG-TS and remuxed to MP4/MKV on stop; interrupted sessions are recovered on next launch. Nothing is captured outside games unless desktop capture is enabled. |
-| Popups | In-game popups with chimes (capture ready, clip saved, recording started/stopped…) in a configurable corner. The popup window never takes focus, ignores the mouse and is excluded from capture. |
-| Hotkeys | Global low-level keyboard hook (`SetWindowsHookEx`): save replay, toggle recording, bookmark, screenshot. |
-| Bookmarks | Stored in the embedded metadata and as container chapters; shown as markers on the player timeline. |
-| Screenshots | PNG/JPEG straight from the duplicated GPU framebuffer. |
-| Library | `<root>/<Game>/<YYYY-MM-DD_HH-MM-SS>_<Kind>.<ext>` (Kind = Clip, Session or Screenshot). Metadata (`game_title`, `executable_name`, `timestamp`, `duration`, `bookmarks`, `resolution`, …) is embedded in every file. A SQLite cache makes the gallery instant; the self-healing scanner rebuilds it — including thumbnails — from the files alone after a reinstall or backup restore. |
-| Gallery | Grid grouped by game or date, filters for game, type, date, duration, search and sort; right-click: open location, open externally, copy file to clipboard, details/bookmarks, delete. Only the library folder and folders you add are shown. |
-| Player & editor | Single click opens the player (fullscreen with F): bookmark timeline, Master mix by default, or the individual tracks with their own volume/mute (pre-extracted, so switching is instant). Crop with the handles or Start/End crop buttons — playback stays inside the crop; save over the original or as a copy, or "+ Clip" a moment out of a long session into a new clip (lossless video copy). |
-| System | Optional *Disable Windows Game Mode* (`HKCU\Software\Microsoft\GameBar`), start with Windows (`HKCU\…\Run`, `--minimized`), tray icon with Pause / Save Replay / Dashboard / Settings / Quit. |
+## Highlights
+- **Replay buffer:** last 15 s – 20 min in RAM, or on disk when it doesn't fit. Saving is a lossless stream copy.
+- **Session recording:** manual, or automatically for each game session. Clips and recordings have independent quality settings.
+- **GPU capture:** captures the game window only (Windows Graphics Capture) and encodes on the GPU with NVENC, AMF or QuickSync; zero-copy where supported, with automatic fallback. No hooks or injection.
+- **"Game not in focus" screen:** shown while you're tabbed out, so other apps never appear in clips.
+- **Multi-track audio:** Master mix, Game (named after the game), Microphone (noise suppression plus a live noise gate), Discord, and any app you pick from a list of running apps, including installed web apps.
+- **In-game popups with chimes:** capture ready, "Saved last 2:00", recording started/stopped… The popup never takes focus and is excluded from capture.
+- **Library:** `<library>/<Game>/<date>_<Clip|Session|Screenshot>.<ext>`, with metadata embedded in each file and a self-healing index. Filters, multi-select delete, and extra folders (e.g. Medal) on request.
+- **Player and editor:** combined or per-track audio, crop with handles or Start/End crop, save over the original or as a copy, "+ Clip" from long sessions, fullscreen.
+- **Desktop capture is off by default:** nothing is captured outside games unless you enable it.
 
+## Known limitations
+- Exclusive-fullscreen games draw over every window, so popups only show in borderless/windowed mode.
+- Games running as administrator need game-capture run as administrator for hotkeys to work.
+- Installed web apps share their browser's audio process, so a web-app track also records other tabs in that browser.
+- Per-app audio needs Windows 10 2004 (build 19041) or newer.
+- This zip is built with the GNU toolchain. The CI pipeline builds an MSVC-toolchain NSIS installer as a workflow artifact.
 
-## Building (Windows)
+## Logs
+`%LOCALAPPDATA%\GameCapture\logs\game-capture.log`
 
-Prerequisites: Rust (stable, MSVC toolchain), Node.js 20+, the
-[Tauri prerequisites](https://tauri.app/start/prerequisites/) (WebView2 is
-preinstalled on Windows 10/11).
-
-```powershell
-npm install                 # root (Tauri CLI) + ui dependencies
-npm run fetch-ffmpeg        # downloads ffmpeg.exe/ffprobe.exe into src-tauri/binaries
-npm run dev                 # run the app with hot reload
-npm run build               # NSIS installer in target/release/bundle/nsis
-```
-
-`npm run build` passes `src-tauri/tauri.bundle.conf.json`, which bundles the
-FFmpeg binaries. Plain `cargo build` works without them; the app then looks
-for FFmpeg next to the executable and on `PATH`.
-
-### Developing on Linux/macOS
-
-The core crates and the UI build anywhere:
-
-```bash
-cargo test -p gc-core -p gc-library -p gc-platform -p gc-audio -p gc-capture
-npm --prefix ui run dev     # UI against an in-browser mock backend
-```
-
-With `ffmpeg` on `PATH`, the end-to-end tests run the real pipeline
-(synthetic video source → encoder → chunker → ring → MP4/MKV with embedded
-metadata and chapters → ffprobe). The Windows code is type-checked with
-`cargo clippy --workspace --target x86_64-pc-windows-gnu`.
-
-## Notes & limitations
-
-- **Per-app audio** needs Windows 10 2004 (build 19041) or newer. On older
-  builds the game track can fall back to the full system mix.
-- **Elevated games**: Windows does not deliver keyboard input from an
-  administrator window to non-elevated hooks; run game-capture elevated for
-  such games.
-- **Capture source**: Desktop Duplication captures the monitor the game is on
-  (cropped for windowed games). Exclusive-fullscreen games on a monitor other
-  than the one being duplicated are not captured.
-- **HDR**: the desktop is captured as 8-bit BGRA; HDR output is tone-mapped by
-  Windows.
-- **Preview player**: uses WebView2's decoders. HEVC/AV1 need the matching
-  Microsoft Store video extensions; anything else can be opened in the default
-  external player from the context menu.
-- **FFmpeg licensing**: the fetch script downloads GPL builds (x264/x265),
-  which are compatible with this project's GPL-3.0 licence.
-
-## License
-
-game-capture is free software: you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation, either version 3 of the License, or (at your option) any later
-version. See [LICENSE](LICENSE).
-
-The bundled FFmpeg is the GPL build from
-[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds) and keeps its own
-licence (`binaries/FFMPEG-LICENSE.txt` in the release zip).
+## Licensing
+The bundled FFmpeg 8.1 is the GPL build from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds). Its licence is in `binaries\FFMPEG-LICENSE.txt`. game-capture itself is licensed under GPL-3.0-or-later (see `LICENSE.txt` in the zip).
