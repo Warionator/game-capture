@@ -125,11 +125,12 @@ impl TrackControl {
     }
     /// Records the peak of the latest block (max-hold until read).
     pub fn update_peak(&self, p: f32) {
-        let _ = self
-            .peak_bits
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                (p > f32::from_bits(old)).then_some(p.to_bits())
-            });
+        // Peaks are non-negative, and non-negative IEEE-754 floats order the
+        // same as their bit patterns, so an integer max is a float max.
+        if p.is_nan() || p <= 0.0 {
+            return;
+        }
+        self.peak_bits.fetch_max(p.to_bits(), Ordering::Relaxed);
     }
     /// Returns and resets the held peak.
     pub fn take_peak(&self) -> f32 {

@@ -3,7 +3,9 @@
   "bundle": {
     "resources": {
       "binaries/ffmpeg.exe": "binaries/ffmpeg.exe",
-      "binaries/ffprobe.exe": "binaries/ffprobe.exe"
+      "binaries/ffprobe.exe": "binaries/ffprobe.exe",
+      "binaries/FFMPEG-LICENSE.txt": "binaries/FFMPEG-LICENSE.txt",
+      "../LICENSE": "LICENSE.txt"
     }
   }
 }

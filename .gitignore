@@ -3,5 +3,6 @@ node_modules/
 /ui/dist
 /src-tauri/gen
 /src-tauri/binaries/*.exe
+/src-tauri/binaries/*.txt
 *.log
 .DS_Store

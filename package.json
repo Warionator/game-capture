@@ -2,6 +2,7 @@
   "name": "game-capture",
   "private": true,
   "version": "1.0.0",
+  "license": "GPL-3.0-or-later",
   "description": "Lightweight game clipping and recording for Windows",
   "scripts": {
     "postinstall": "npm --prefix ui install",

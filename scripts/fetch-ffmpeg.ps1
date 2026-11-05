@@ -50,6 +50,9 @@ try {
         if (-not $found) { throw "$exe missing from archive" }
         Copy-Item $found.FullName (Join-Path $Destination $exe) -Force
     }
+    $license = Get-ChildItem -Path $tmp -Recurse -Filter "LICENSE.txt" | Select-Object -First 1
+    if (-not $license) { throw "LICENSE.txt missing from archive" }
+    Copy-Item $license.FullName (Join-Path $Destination "FFMPEG-LICENSE.txt") -Force
     & (Join-Path $Destination "ffmpeg.exe") -hide_banner -version | Select-Object -First 1
     Write-Host "FFmpeg installed to $Destination"
 } finally {
