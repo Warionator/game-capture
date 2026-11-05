@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "game-capture"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "gc-audio"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "gc-capture"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "gc-core"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1246,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "gc-library"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1262,7 +1262,7 @@ dependencies = [
 
 [[package]]
 name = "gc-platform"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
