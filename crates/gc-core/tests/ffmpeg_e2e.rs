@@ -76,6 +76,7 @@ fn encode_chunk_ring_remux_probe() {
         mixdown: true,
         audio_bitrate_kbps: 128,
         output: Output::StdoutTs,
+        ts_offset_secs: 0.0,
     };
     let mut child = Command::new("ffmpeg")
         .args(spec.build_args())

@@ -1,5 +1,5 @@
 use crate::ffmpeg::{choose_backends, codec_label, probe_encoders, EncoderInfo, Ffmpeg};
-use crate::pipeline::{AudioPlan, Pipeline, RingPlan};
+use crate::pipeline::{window_sends_frames, AudioPlan, Pipeline, RingPlan, RingSource, Shared};
 use crate::screenshot::{self, ShotTarget};
 use crate::session::SessionWriter;
 use chrono::{DateTime, Duration as ChronoDuration, Local};
@@ -250,11 +250,17 @@ impl CaptureEngine {
             current_encoder: None,
             shutting_down: false,
             degraded: false,
+            no_focus_screen: false,
             capture_label: None,
             replay_quality: None,
             announced: None,
             capture_window: None,
             window_change: None,
+            window_probe: None,
+            next_window_probe: None,
+            window_probe_backoff: Duration::from_secs(2),
+            failed_window_probes: 0,
+            standby_stills: Vec::new(),
         };
         let thread = std::thread::Builder::new()
             .name("gc-capture-engine".into())
@@ -455,9 +461,12 @@ struct Worker {
     /// During shutdown sessions are finalised synchronously so the process
     /// does not exit mid-remux.
     shutting_down: bool,
-    /// Window capture / focus screen stalled once for this game: use the
-    /// plain monitor capture until the game changes.
+    /// Window capture stalled for this game: capture the monitor until the
+    /// game or its window changes.
     degraded: bool,
+    /// The focus screen stalled for this game: leave it out until the game
+    /// changes.
+    no_focus_screen: bool,
     capture_label: Option<&'static str>,
     /// Quality the running replay pipeline was started with.
     replay_quality: Option<Quality>,
@@ -467,7 +476,30 @@ struct Worker {
     capture_window: Option<GameWindow>,
     /// A different game window seen by consecutive ticks, and how many.
     window_change: Option<(GameWindow, u8)>,
+    /// Running check whether the game window sends frames again (standby).
+    window_probe: Option<Arc<Mutex<Option<bool>>>>,
+    /// Earliest next check, and the delay after a failed one.
+    next_window_probe: Option<Instant>,
+    window_probe_backoff: Duration,
+    /// Failed checks in a row while the game was in front.
+    failed_window_probes: u32,
+    /// Held-frame images written for standby pipelines.
+    standby_stills: Vec<std::path::PathBuf>,
 }
+
+/// Where [`Worker::switch_slot`] moves a pipeline.
+enum Switch {
+    /// Hold the last frame; the window capture to resume later.
+    Standby(PipelineSpec),
+    /// Back to this window capture.
+    Resume(PipelineSpec),
+}
+
+/// No video for this long from window capture: switch to standby.
+const WINDOW_STALL: Duration = Duration::from_secs(3);
+/// Failed checks in a row, with the game in front, after which window
+/// capture is given up for monitor capture (window can't be captured).
+const MAX_FAILED_WINDOW_PROBES: u32 = 8;
 
 /// A game's main window: handle, client size and, when capture follows the
 /// window's position on the monitor (Desktop Duplication), its rectangle.
@@ -602,6 +634,7 @@ impl Worker {
                     return;
                 }
                 self.degraded = false;
+                self.no_focus_screen = false;
                 self.window_change = None;
                 if self.is_recording() && !ended {
                     // Switched games mid-recording: keep recording.
@@ -755,6 +788,7 @@ impl Worker {
                 *m = None;
             }
         }
+        self.manage_standby();
         // Recorder health: a dead recorder ends the recording.
         let recorder_dead = {
             let mut g = self.recorder.lock();
@@ -779,26 +813,43 @@ impl Worker {
             self.stop_recorder(true);
         }
 
+        // (error text, the game window stopped sending frames)
         let dead = {
             let mut guard = self.replay.lock();
             match guard.as_mut() {
                 Some(p) if p.shared.stalled(Duration::from_secs(8)) => {
-                    // Running but producing nothing (typically a window that
-                    // can't be captured): retry with plain monitor capture.
-                    if p.spec.focus_screen.is_some()
-                        || matches!(p.spec.video, VideoSource::Window { .. })
-                    {
+                    // Running but producing nothing: a window that is
+                    // minimised, not drawing or can't be captured (retry on
+                    // the monitor, keeping the focus screen), or else the
+                    // focus screen (retry without it).
+                    let window = matches!(p.spec.video, VideoSource::Window { .. });
+                    if window {
                         self.degraded = true;
+                    } else if p.spec.focus_screen.is_some() {
+                        self.no_focus_screen = true;
                     }
-                    Some(format!("no video for 8 s. {}", p.shared.stderr_summary()))
+                    Some((
+                        format!("no video for 8 s. {}", p.shared.stderr_summary()),
+                        window,
+                    ))
                 }
-                Some(p) => (!p.is_running()).then(|| p.shared.stderr_summary()),
+                Some(p) => (!p.is_running()).then(|| (p.shared.stderr_summary(), false)),
                 None => None,
             }
         };
-        if let Some(err) = dead {
-            self.last_error = Some(format!("Capture stopped unexpectedly: {err}"));
-            self.notice(true, self.last_error.clone().unwrap_or_default());
+        if let Some((err, window_stalled)) = dead {
+            if window_stalled {
+                // Expected when the game is minimised or not drawing; not
+                // an error the player can do anything about.
+                log::warn!("window capture stalled: {err}");
+                self.notice(
+                    false,
+                    "The game window stopped sending frames; capturing the monitor instead",
+                );
+            } else {
+                self.last_error = Some(format!("Capture stopped unexpectedly: {err}"));
+                self.notice(true, self.last_error.clone().unwrap_or_default());
+            }
             self.stop_replay(true);
             self.next_restart = Some(Instant::now() + self.restart_backoff);
             self.restart_backoff = (self.restart_backoff * 2).min(Duration::from_secs(60));
@@ -810,6 +861,276 @@ impl Worker {
             self.start_pipeline();
         }
         self.check_game_window();
+    }
+
+    /// Window capture gets no frames while the game window is minimised or
+    /// not drawing (loading, shader compiles), and that stalls the whole
+    /// FFmpeg graph: audio and the focus screen too. Such pipelines move to
+    /// a standby source that holds the last frame (the focus screen still
+    /// switches on top), keeping the replay buffer, the recording and the
+    /// audio going, and move back once the window sends frames again.
+    fn manage_standby(&mut self) {
+        let minimised = self.game.is_some() && self.current_game_window(false).is_none();
+        for slot in [self.replay.clone(), self.recorder.clone()] {
+            let stalled_window = slot.lock().as_ref().and_then(|p| {
+                (matches!(p.spec.video, VideoSource::Window { .. })
+                    && (minimised || p.shared.stalled(WINDOW_STALL)))
+                .then(|| p.spec.clone())
+            });
+            if let Some(spec) = stalled_window {
+                log::info!(
+                    "game window sends no frames (minimised: {minimised}); holding the last frame"
+                );
+                self.switch_slot(&slot, Switch::Standby(spec));
+            }
+        }
+        self.try_resume_window();
+    }
+
+    /// Audio sources and track layout for a new pipeline.
+    fn audio_plan(&self) -> AudioPlan {
+        let s = &self.settings;
+        AudioPlan {
+            layout: s.audio.track_layout(),
+            game_pid: self.game.as_ref().map(|g| g.pid),
+            mic_device: s.audio.mic.device_id.clone(),
+            system_fallback: s
+                .audio
+                .system_audio_fallback
+                .unwrap_or(!gc_platform::system::supports_process_loopback()),
+        }
+    }
+
+    /// Replaces window-capture pipeline `p` (running, but the window sends
+    /// no frames) with its standby variant on the same ring.
+    fn standby_takeover(
+        &mut self,
+        ff: &Ffmpeg,
+        p: Pipeline,
+        audio: &AudioPlan,
+        game_pid: Option<u32>,
+    ) -> Option<Pipeline> {
+        let spec = p.spec.clone();
+        let shared = p.handover(Duration::ZERO);
+        let still = self.last_frame(&shared);
+        let standby = self.standby_spec(&spec, still);
+        let mut sp =
+            Pipeline::start_on(ff, standby, audio, RingSource::Takeover(shared), game_pid).ok()?;
+        if let Err(e) = sp.wait_healthy(Duration::from_secs(8)) {
+            log::warn!("standby capture failed: {e}");
+            return None;
+        }
+        sp.resume = Some(spec);
+        Some(sp)
+    }
+
+    /// Decodes the newest frame in the ring to an image the standby source
+    /// can hold. `None` when nothing was captured yet.
+    fn last_frame(&mut self, shared: &Shared) -> Option<String> {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let ff = self.ff.clone()?;
+        let chunk = shared.ring.lock().snapshot(0.0).pop()?;
+        let data = chunk.read_all().ok()?;
+        let path = self.temp_dir.join(format!(
+            "standby-{}-{}.png",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut child = ff
+            .command()
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "mpegts",
+                "-i",
+                "pipe:0",
+            ])
+            .args(["-map", "0:v:0", "-update", "1", "-y"])
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(&data);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        if !path.exists() {
+            log::warn!("could not decode the last frame for standby");
+            return None;
+        }
+        self.standby_stills.push(path.clone());
+        Some(path.to_string_lossy().into_owned())
+    }
+
+    /// Deletes the held-frame images once no pipeline uses them.
+    fn remove_standby_stills(&mut self) {
+        for p in self.standby_stills.drain(..) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// The standby variant of a window-capture spec: same size, encoder,
+    /// audio and focus screen, so the stream continues seamlessly.
+    fn standby_spec(&self, window: &PipelineSpec, still: Option<String>) -> PipelineSpec {
+        let font_file = window
+            .focus_screen
+            .as_ref()
+            .and_then(|f| f.font_file.clone())
+            .or_else(|| {
+                self.probe
+                    .read()
+                    .as_ref()
+                    .and_then(|(caps, _)| Self::focus_font(caps))
+            });
+        PipelineSpec {
+            video: VideoSource::Standby { still, font_file },
+            zero_copy: false,
+            ..window.clone()
+        }
+    }
+
+    /// Moves the pipeline in `slot` to standby or back to window capture
+    /// without losing its replay buffer or recording. Falls back to
+    /// standby, and ends the pipeline if nothing starts.
+    fn switch_slot(&mut self, slot: &Slot, to: Switch) {
+        let Some(ff) = self.ff.clone() else { return };
+        let Some(old) = slot.lock().take() else {
+            return;
+        };
+        // Leaving window capture means it stalled: nothing left to flush.
+        let grace = if matches!(old.spec.video, VideoSource::Window { .. }) {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(4)
+        };
+        let mut shared = old.handover(grace);
+        let audio = self.audio_plan();
+        let game_pid = self.game.as_ref().map(|g| g.pid);
+        // (spec, window capture to resume later)
+        let still = self.last_frame(&shared);
+        let attempts = match to {
+            Switch::Standby(window) => vec![(self.standby_spec(&window, still), Some(window))],
+            Switch::Resume(window) => vec![
+                (window.clone(), None),
+                (self.standby_spec(&window, still), Some(window)),
+            ],
+        };
+        for (spec, resume) in attempts {
+            let source = RingSource::Takeover(shared.clone());
+            match Pipeline::start_on(&ff, spec, &audio, source, game_pid) {
+                Ok(mut p) => match p.wait_healthy(Duration::from_secs(8)) {
+                    Ok(()) => {
+                        p.resume = resume;
+                        *slot.lock() = Some(p);
+                        return;
+                    }
+                    Err(e) => {
+                        log::warn!("switching capture failed: {e}");
+                        shared = p.handover(Duration::ZERO);
+                    }
+                },
+                Err(e) => log::warn!("switching capture failed: {e}"),
+            }
+        }
+        // Nothing starts: keep what was recorded; the tick restarts capture.
+        let session = shared.session.lock().take();
+        if let Some(session) = session {
+            self.finish_session(session);
+        }
+    }
+
+    /// On standby: while the game is in front, check now and then whether
+    /// its window sends frames again, and switch back to window capture.
+    fn try_resume_window(&mut self) {
+        let resume = [&self.replay, &self.recorder]
+            .iter()
+            .find_map(|s| s.lock().as_ref().and_then(|p| p.resume.clone()));
+        let Some(window_spec) = resume else {
+            self.window_probe = None;
+            self.next_window_probe = None;
+            self.window_probe_backoff = Duration::from_secs(2);
+            self.failed_window_probes = 0;
+            return;
+        };
+        let VideoSource::Window { hwnd, .. } = window_spec.video else {
+            return;
+        };
+        let finished = self.window_probe.as_ref().and_then(|r| *r.lock());
+        if let Some(sends_frames) = finished {
+            self.window_probe = None;
+            if sends_frames {
+                log::info!("game window sends frames again; resuming window capture");
+                self.failed_window_probes = 0;
+                self.window_probe_backoff = Duration::from_secs(2);
+                for slot in [self.replay.clone(), self.recorder.clone()] {
+                    let spec = slot.lock().as_ref().and_then(|p| p.resume.clone());
+                    if let Some(spec) = spec {
+                        self.switch_slot(&slot, Switch::Resume(spec));
+                    }
+                }
+                let on_standby = [&self.replay, &self.recorder]
+                    .iter()
+                    .any(|s| s.lock().as_ref().is_some_and(|p| p.resume.is_some()));
+                if !on_standby {
+                    self.remove_standby_stills();
+                }
+                return;
+            }
+            self.failed_window_probes += 1;
+            self.next_window_probe = Some(Instant::now() + self.window_probe_backoff);
+            self.window_probe_backoff =
+                (self.window_probe_backoff * 2).min(Duration::from_secs(30));
+            if self.failed_window_probes >= MAX_FAILED_WINDOW_PROBES {
+                // In front for minutes without a frame: this window can't be
+                // captured. Capture the monitor instead.
+                self.degraded = true;
+                self.failed_window_probes = 0;
+                self.notice(
+                    false,
+                    "The game window can't be captured; capturing the monitor instead",
+                );
+                let was_recording = self.is_recording();
+                self.stop_pipeline(true);
+                if self.wants_pipeline() {
+                    self.start_pipeline();
+                }
+                if was_recording {
+                    self.start_recording();
+                }
+            }
+            return;
+        }
+        if self.window_probe.is_some() || self.next_window_probe.is_some_and(|t| Instant::now() < t)
+        {
+            return;
+        }
+        // Only worth checking while the game is in front and not minimised.
+        let in_front = self.game.as_ref().is_some_and(|g| {
+            gc_platform::process::foreground_window().is_some_and(|f| f.pid == g.pid)
+        });
+        if !in_front || self.current_game_window(false).is_none() {
+            return;
+        }
+        let Some(ff) = self.ff.clone() else { return };
+        let result = Arc::new(Mutex::new(None));
+        let out = result.clone();
+        let spawned = std::thread::Builder::new()
+            .name("gc-window-probe".into())
+            .spawn(move || *out.lock() = Some(window_sends_frames(&ff, hwnd)));
+        if spawned.is_ok() {
+            self.window_probe = Some(result);
+        }
     }
 
     /// The game's current main window and its client size, plus its
@@ -1018,15 +1339,7 @@ impl Worker {
         let window = self.current_game_window(true);
         let targets = self.resolve_targets(&caps);
         let font = Self::focus_font(&caps);
-        let audio = AudioPlan {
-            layout: s.audio.track_layout(),
-            game_pid: self.game.as_ref().map(|g| g.pid),
-            mic_device: s.audio.mic.device_id.clone(),
-            system_fallback: s
-                .audio
-                .system_audio_fallback
-                .unwrap_or(!gc_platform::system::supports_process_loopback()),
-        };
+        let audio = self.audio_plan();
 
         let mut errors = Vec::new();
         let order = choose_backends(s.video.encoder, s.video.codec, &probed);
@@ -1042,7 +1355,7 @@ impl Worker {
             for target in &targets {
                 let focus_variants: &[bool] = if s.video.focus_screen
                     && target.focus_ok
-                    && !self.degraded
+                    && !self.no_focus_screen
                     && game_pid.is_some()
                 {
                     &[true, false]
@@ -1069,14 +1382,25 @@ impl Worker {
                             mixdown: s.audio.mixdown_enabled,
                             audio_bitrate_kbps: 160,
                             output: Output::StdoutTs,
+                            ts_offset_secs: 0.0,
                         };
                         if zero_copy && !spec.is_zero_copy() {
                             continue; // identical to the download variant
                         }
+                        let window_target = matches!(target.video, VideoSource::Window { .. });
                         let started = Pipeline::start(&ff, spec, &audio, ring.clone(), game_pid)
-                            .and_then(|mut p| {
-                                p.wait_healthy(Duration::from_secs(8))?;
-                                Ok(p)
+                            .and_then(|mut p| match p.wait_healthy(Duration::from_secs(8)) {
+                                Ok(()) => Ok(p),
+                                // Captures fine but the window sends no frames
+                                // yet (loading): show the focus screen until
+                                // it does.
+                                Err(e) if window_target && p.is_running() => {
+                                    log::info!(
+                                        "game window sends no frames yet; starting on standby"
+                                    );
+                                    self.standby_takeover(&ff, p, &audio, game_pid).ok_or(e)
+                                }
+                                Err(e) => Err(e),
                             });
                         let name = encoder_name(backend, codec);
                         match started {
@@ -1200,6 +1524,7 @@ impl Worker {
     fn stop_pipeline(&mut self, finalize: bool) {
         self.stop_recorder(finalize);
         self.stop_replay(finalize);
+        self.remove_standby_stills();
         if let Some(s) = self.pending.take() {
             self.settings = *s;
         }

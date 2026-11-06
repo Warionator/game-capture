@@ -185,6 +185,17 @@ pub enum VideoSource {
     },
     /// Synthetic pattern; used by tests and on non-Windows development hosts.
     TestPattern,
+    /// Stands in for window capture while the game window sends no frames
+    /// (minimised, or not drawing), which would stall the whole FFmpeg
+    /// graph: the game's last frame held still, in real time, so audio keeps
+    /// recording. The focus screen still switches on top as usual.
+    Standby {
+        /// Image of the last captured frame; `None` = the focus-screen
+        /// picture instead (nothing was captured yet).
+        still: Option<String>,
+        /// TTF for the focus-screen caption; `None` = plain screen.
+        font_file: Option<String>,
+    },
 }
 
 impl VideoSource {
@@ -200,7 +211,7 @@ impl VideoSource {
             VideoSource::Ddagrab { adapter_idx, .. } | VideoSource::Window { adapter_idx, .. } => {
                 *adapter_idx
             }
-            VideoSource::TestPattern => None,
+            VideoSource::TestPattern | VideoSource::Standby { .. } => None,
         }
     }
 }
@@ -261,6 +272,9 @@ pub struct PipelineSpec {
     pub mixdown: bool,
     pub audio_bitrate_kbps: u32,
     pub output: Output,
+    /// Added to every output timestamp (seconds), so a pipeline that takes
+    /// over from another continues its timeline instead of restarting at 0.
+    pub ts_offset_secs: f64,
 }
 
 /// Escapes a value for use inside a single-quoted filter option.
@@ -361,9 +375,14 @@ impl PipelineSpec {
 
     /// The focus-screen source, sized like the capture.
     fn focus_source(&self, f: &FocusScreen, upload: bool) -> String {
+        self.screen_source(&f.font_file, 1, upload)
+    }
+
+    /// The focus-screen picture at `rate` frames per second.
+    fn screen_source(&self, font_file: &Option<String>, rate: u32, upload: bool) -> String {
         let (w, h) = self.source_size;
-        let mut src = format!("color=c={FOCUS_SCREEN_COLOR}:s={w}x{h}:r=1");
-        if let Some(font) = &f.font_file {
+        let mut src = format!("color=c={FOCUS_SCREEN_COLOR}:s={w}x{h}:r={rate}");
+        if let Some(font) = font_file {
             let font = filter_quote(font);
             let big = (h / 16).max(16);
             let small = (h / 36).max(10);
@@ -484,6 +503,24 @@ impl PipelineSpec {
                 let (w, h) = self.source_size;
                 format!("testsrc2=size={w}x{h}:rate={rate},realtime")
             }
+            VideoSource::Standby { still, font_file } => {
+                // One frame a second, repeated up to the encode rate and
+                // paced to real time like a live capture.
+                let fps = if self.fps.is_uncapped() {
+                    60
+                } else {
+                    self.fps.0
+                };
+                let (w, h) = self.source_size;
+                let picture = match still {
+                    Some(img) => format!(
+                        "movie={}:loop=0,setpts=N/TB,scale={w}:{h},format=bgra",
+                        filter_quote(img)
+                    ),
+                    None => self.screen_source(font_file, 1, false),
+                };
+                format!("{picture},fps={fps},realtime")
+            }
         };
 
         // --- audio inputs (indices 0..n) ---------------------------------
@@ -597,6 +634,12 @@ impl PipelineSpec {
         }
 
         // --- output -------------------------------------------------------
+        if self.ts_offset_secs > 0.0 {
+            push(
+                &mut a,
+                &["-output_ts_offset", &format!("{:.3}", self.ts_offset_secs)],
+            );
+        }
         match &self.output {
             Output::StdoutTs => push(
                 &mut a,
@@ -1217,6 +1260,7 @@ mod tests {
             mixdown: true,
             audio_bitrate_kbps: 160,
             output: Output::StdoutTs,
+            ts_offset_secs: 0.0,
         }
     }
 
@@ -1369,6 +1413,62 @@ mod tests {
         let args = s.build_args();
         let fc = arg_after(&args, "-filter_complex").unwrap();
         assert!(fc.contains("[cap][fs]streamselect=inputs=2:map=0,fps=60,scale_d3d11=width=1920:height=1080:format=nv12[v]"), "{fc}");
+    }
+
+    #[test]
+    fn standby_holds_last_frame_with_focus_switch() {
+        let mut s = spec();
+        s.video = VideoSource::Standby {
+            still: Some(r"C:\Temp\standby-1-0.png".into()),
+            font_file: None,
+        };
+        s.source_size = (1920, 1080);
+        s.focus_screen = Some(FocusScreen { font_file: None });
+        assert!(!s.is_zero_copy());
+        let a = s.build_args();
+        assert_eq!(arg_after(&a, "-init_hw_device"), None);
+        let fc = arg_after(&a, "-filter_complex").unwrap();
+        assert!(
+            fc.starts_with(
+                "movie='C\\:/Temp/standby-1-0.png':loop=0,setpts=N/TB,scale=1920:1080,format=bgra,fps=60,realtime[cap];"
+            ),
+            "{fc}"
+        );
+        // The focus screen switches on top (CPU path), with its keepalive.
+        assert!(fc.contains("[cap][fs]streamselect=inputs=2:map=0"), "{fc}");
+        assert!(fc.contains("anullsink"), "{fc}");
+    }
+
+    #[test]
+    fn standby_source_is_realtime_focus_screen_with_ts_offset() {
+        let mut s = spec();
+        s.video = VideoSource::Standby {
+            still: None,
+            font_file: Some(r"C:\Windows\Fonts\segoeui.ttf".into()),
+        };
+        s.source_size = (1920, 1080);
+        s.ts_offset_secs = 12.5;
+        // CPU source: no shared D3D11 device, no zero-copy.
+        assert!(!s.is_zero_copy());
+        let a = s.build_args();
+        assert_eq!(arg_after(&a, "-init_hw_device"), None);
+        let fc = arg_after(&a, "-filter_complex").unwrap();
+        assert!(
+            fc.starts_with("color=c=0x0b0d12:s=1920x1080:r=1,drawtext="),
+            "{fc}"
+        );
+        assert!(fc.contains("text='Game not in focus'"), "{fc}");
+        assert!(
+            fc.contains(",format=bgra,fps=60,realtime,format=nv12[v]"),
+            "{fc}"
+        );
+        assert_eq!(arg_after(&a, "-output_ts_offset"), Some("12.500"));
+        // The offset comes right before the output options.
+        let off = a.iter().position(|x| x == "-output_ts_offset").unwrap();
+        assert!(off < a.iter().position(|x| x == "pipe:1").unwrap());
+
+        s.ts_offset_secs = 0.0;
+        assert_eq!(arg_after(&s.build_args(), "-output_ts_offset"), None);
     }
 
     #[test]

@@ -86,6 +86,7 @@ fn focus_screen_switches_live() {
         mixdown: false,
         audio_bitrate_kbps: 128,
         output: Output::File(out.to_string_lossy().into_owned()),
+        ts_offset_secs: 0.0,
     };
     let mut ff = Command::new("ffmpeg")
         .args(spec.build_args())

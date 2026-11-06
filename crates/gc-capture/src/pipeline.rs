@@ -46,6 +46,10 @@ pub struct Shared {
     pub last_chunk_at: Mutex<Instant>,
     /// The "Game not in focus" screen is currently shown.
     pub focus_lost: AtomicBool,
+    /// When the first pipeline on this ring started. Pipelines that take
+    /// over the ring offset their timestamps by the time since then, so the
+    /// stream's timeline continues across FFmpeg processes.
+    pub origin: Instant,
 }
 
 impl Shared {
@@ -81,6 +85,13 @@ impl Shared {
     }
 }
 
+/// Where a pipeline's ring, session and bookmarks come from.
+pub enum RingSource {
+    New(RingPlan),
+    /// Continue another (stopped) pipeline's ring, session and bookmarks.
+    Takeover(Arc<Shared>),
+}
+
 pub struct Pipeline {
     child: Child,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
@@ -92,6 +103,9 @@ pub struct Pipeline {
     pub audio_titles: Vec<String>,
     /// Titles of the tracks mixed into the Master track.
     pub mix_titles: Vec<String>,
+    /// On standby: the window capture to return to once the game window
+    /// sends frames again.
+    pub resume: Option<PipelineSpec>,
 }
 
 impl Pipeline {
@@ -100,11 +114,58 @@ impl Pipeline {
     /// foreground window the recording shows the focus screen instead.
     pub fn start(
         ff: &Ffmpeg,
-        mut spec: PipelineSpec,
+        spec: PipelineSpec,
         audio: &AudioPlan,
         ring: RingPlan,
         focus_pid: Option<u32>,
     ) -> anyhow::Result<Self> {
+        Self::start_on(ff, spec, audio, RingSource::New(ring), focus_pid)
+    }
+
+    /// Starts a pipeline on `ring`: a new one, or one handed over by
+    /// [`Pipeline::handover`] (the recording and replay buffer continue).
+    pub fn start_on(
+        ff: &Ffmpeg,
+        mut spec: PipelineSpec,
+        audio: &AudioPlan,
+        ring: RingSource,
+        focus_pid: Option<u32>,
+    ) -> anyhow::Result<Self> {
+        // Set up the ring first: a takeover continues the old timeline.
+        let shared = match ring {
+            RingSource::New(ring) => {
+                spec.ts_offset_secs = 0.0;
+                Arc::new(Shared {
+                    ring: Mutex::new(ReplayRing::new(ring.window, ring.store, ring.max_bytes)?),
+                    chunker: Mutex::new(TsChunker::new()),
+                    session: Mutex::new(None),
+                    bookmarks: Mutex::new(Vec::new()),
+                    chunks: AtomicU64::new(0),
+                    bytes: AtomicU64::new(0),
+                    exited: AtomicBool::new(false),
+                    stderr_tail: Mutex::new(VecDeque::new()),
+                    last_chunk_at: Mutex::new(Instant::now()),
+                    focus_lost: AtomicBool::new(false),
+                    origin: Instant::now(),
+                })
+            }
+            RingSource::Takeover(shared) => {
+                *shared.chunker.lock() = TsChunker::new();
+                shared.chunks.store(0, Ordering::SeqCst);
+                shared.exited.store(false, Ordering::SeqCst);
+                shared.stderr_tail.lock().clear();
+                *shared.last_chunk_at.lock() = Instant::now();
+                spec.ts_offset_secs = shared.origin.elapsed().as_secs_f64();
+                shared
+            }
+        };
+        // Standby without a frame to hold shows the focus-screen picture.
+        let focus_picture = matches!(
+            spec.video,
+            gc_core::ffmpeg::VideoSource::Standby { still: None, .. }
+        );
+        shared.focus_lost.store(focus_picture, Ordering::Relaxed);
+
         let inputs: Vec<&TrackSpec> = audio
             .layout
             .iter()
@@ -188,19 +249,6 @@ impl Pipeline {
             None
         };
 
-        let shared = Arc::new(Shared {
-            ring: Mutex::new(ReplayRing::new(ring.window, ring.store, ring.max_bytes)?),
-            chunker: Mutex::new(TsChunker::new()),
-            session: Mutex::new(None),
-            bookmarks: Mutex::new(Vec::new()),
-            chunks: AtomicU64::new(0),
-            bytes: AtomicU64::new(0),
-            exited: AtomicBool::new(false),
-            stderr_tail: Mutex::new(VecDeque::new()),
-            last_chunk_at: Mutex::new(Instant::now()),
-            focus_lost: AtomicBool::new(false),
-        });
-
         {
             let shared = shared.clone();
             std::thread::Builder::new()
@@ -253,6 +301,7 @@ impl Pipeline {
             spec,
             audio_titles,
             mix_titles,
+            resume: None,
         })
     }
 
@@ -308,6 +357,20 @@ impl Pipeline {
     /// if it does not exit in time. Returns the session writer, if any, so
     /// the caller can finalise it.
     pub fn stop(mut self) -> Option<SessionWriter> {
+        self.shutdown(Duration::from_secs(4));
+        self.shared.session.lock().take()
+    }
+
+    /// Stops FFmpeg and the audio engine but keeps the ring, session and
+    /// bookmarks, for [`Pipeline::start_on`] with [`RingSource::Takeover`].
+    /// `grace`: how long FFmpeg may take to flush before it is killed; a
+    /// stalled graph never reacts to `q`, and has nothing left to flush.
+    pub fn handover(mut self, grace: Duration) -> Arc<Shared> {
+        self.shutdown(grace);
+        self.shared.clone()
+    }
+
+    fn shutdown(&mut self, grace: Duration) {
         if let Some((stop, t)) = self.focus.take() {
             stop.store(true, Ordering::SeqCst);
             let _ = t.join();
@@ -316,7 +379,7 @@ impl Pipeline {
             let _ = stdin.write_all(b"q\n");
             let _ = stdin.flush();
         }
-        let deadline = Instant::now() + Duration::from_secs(4);
+        let deadline = Instant::now() + grace;
         while Instant::now() < deadline {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
                 break;
@@ -331,7 +394,6 @@ impl Pipeline {
         if let Some(a) = self.audio.take() {
             a.stop();
         }
-        self.shared.session.lock().take()
     }
 }
 
@@ -393,7 +455,11 @@ fn focus_loop(
     let mut candidate_since: Option<bool> = None;
     while !stop.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(200));
-        let in_focus = gc_platform::process::foreground_window().is_some_and(|f| f.pid == game_pid);
+        // A minimised game can stay the foreground window when nothing else
+        // takes over; it is out of focus all the same (no client area).
+        let in_focus = gc_platform::process::foreground_window().is_some_and(|f| {
+            f.pid == game_pid && gc_platform::display::window_client_size(f.hwnd).is_some()
+        });
         let want = !in_focus;
         if want == shown {
             candidate_since = None;
@@ -417,4 +483,41 @@ fn focus_loop(
         shared.focus_lost.store(want, Ordering::Relaxed);
         log::debug!("focus screen {}", if want { "on" } else { "off" });
     }
+}
+
+/// Whether `hwnd` sends frames to Windows Graphics Capture right now (a
+/// minimised or non-drawing window sends none). Blocks up to ~3 s.
+pub fn window_sends_frames(ff: &Ffmpeg, hwnd: u64) -> bool {
+    let child = ff
+        .command()
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-filter_complex",
+            &format!("gfxcapture=hwnd={hwnd}:max_framerate=30:capture_cursor=0[v]"),
+            "-map",
+            "[v]",
+            "-frames:v",
+            "3",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else { return false };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
 }
