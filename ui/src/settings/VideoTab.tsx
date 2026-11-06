@@ -127,15 +127,15 @@ export function VideoTab() {
         </Field>
         <Field
           label="Capture games by"
-          hint="Game window records only the game itself, so other apps and notifications never appear. Monitor records the whole screen the game is on."
+          hint="Entire monitor records the screen the game is on; with the focus screen on, nothing else is recorded while you're tabbed out. Game window records only the game itself, but on Windows 10 it draws a yellow border around the game and can make clips judder."
         >
           <Select<CaptureMode>
             label="Capture method"
             value={v.captureMode}
             onChange={(val) => update((x) => void (x.video.captureMode = val))}
             options={[
-              { value: "window", label: "Game window (recommended)" },
-              { value: "monitor", label: "Entire monitor" },
+              { value: "monitor", label: "Entire monitor (recommended)" },
+              { value: "window", label: "Game window" },
             ]}
           />
         </Field>

@@ -62,6 +62,8 @@ export interface Settings {
   storageRoot: string;
   /** Extra folders shown in the gallery (indexed read-only). */
   extraLibraryFolders: string[];
+  /** Settings defaults version (migration marker; round-tripped as is). */
+  settingsVersion?: number;
   video: {
     captureMode: CaptureMode;
     focusScreen: boolean;

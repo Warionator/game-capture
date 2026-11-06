@@ -9,7 +9,8 @@ default-run = "game-capture"
 
 [lib]
 name = "game_capture_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Desktop only: a cdylib would export more symbols than the MinGW linker allows.
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

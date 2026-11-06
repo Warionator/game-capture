@@ -119,7 +119,7 @@ let settings: Settings = {
   storageRoot: "D:\\Videos\\game-capture",
   extraLibraryFolders: [],
   video: {
-    captureMode: "window",
+    captureMode: "monitor",
     focusScreen: true,
     allowDesktopCapture: false,
     resolution: "native",

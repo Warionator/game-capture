@@ -13,6 +13,11 @@ pub const REPLAY_MAX_SECS: u32 = 20 * 60;
 pub const BITRATE_MIN_KBPS: u32 = 1_000;
 pub const BITRATE_MAX_KBPS: u32 = 100_000;
 
+/// Version of the settings defaults. Files written before a change of
+/// default are migrated once on load (see [`Settings::migrate`]).
+/// 1: monitor capture became the default capture mode.
+pub const SETTINGS_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
@@ -31,6 +36,10 @@ pub struct Settings {
     pub games: GameSettings,
     pub recording: RecordingSettings,
     pub overlay: OverlaySettings,
+    /// [`SETTINGS_VERSION`] the file was written with; 0 when it predates
+    /// versioning.
+    #[serde(default)]
+    pub settings_version: u32,
 }
 
 /// Full-session recording.
@@ -87,6 +96,7 @@ impl Default for Settings {
             games: GameSettings::default(),
             recording: RecordingSettings::default(),
             overlay: OverlaySettings::default(),
+            settings_version: SETTINGS_VERSION,
         }
     }
 }
@@ -106,6 +116,7 @@ impl Settings {
         match std::fs::read_to_string(path) {
             Ok(text) => match serde_json::from_str::<Settings>(&text) {
                 Ok(mut s) => {
+                    s.migrate();
                     s.sanitize();
                     s
                 }
@@ -120,6 +131,19 @@ impl Settings {
             },
             Err(_) => Self::default(),
         }
+    }
+
+    /// Brings a file written under older defaults up to date. Only values
+    /// that were silently defaulted change; later explicit choices are
+    /// kept because the file then carries the current version.
+    pub fn migrate(&mut self) {
+        if self.settings_version < 1 {
+            // Window capture was the default, but on Windows 10 it draws a
+            // yellow border and paces frames unevenly. Monitor capture with
+            // the focus screen gives the same privacy when tabbed out.
+            self.video.capture_mode = CaptureMode::Monitor;
+        }
+        self.settings_version = SETTINGS_VERSION;
     }
 
     /// Atomically writes the settings (write to temp file, then rename).
@@ -344,10 +368,13 @@ impl Container {
 #[serde(rename_all = "camelCase")]
 pub enum CaptureMode {
     /// Windows Graphics Capture of the game window only: other windows and
-    /// notifications can never appear in a clip.
-    #[default]
+    /// notifications can never appear in a clip. On Windows 10 it draws a
+    /// yellow border around the game and delivers frames unevenly.
     Window,
-    /// DXGI Desktop Duplication of the monitor the game is on.
+    /// DXGI Desktop Duplication of the monitor the game is on (or of the
+    /// game window's area, for a windowed game). With the focus screen,
+    /// nothing else is recorded while the game is out of focus.
+    #[default]
     Monitor,
 }
 
@@ -380,7 +407,7 @@ pub struct VideoSettings {
 impl Default for VideoSettings {
     fn default() -> Self {
         Self {
-            capture_mode: CaptureMode::Window,
+            capture_mode: CaptureMode::Monitor,
             focus_screen: true,
             allow_desktop_capture: false,
             quality: Quality::default(),
@@ -946,6 +973,30 @@ mod tests {
         a.game.enabled = false;
         a.voice.source.enabled = false;
         assert!(a.track_layout().is_empty());
+    }
+
+    #[test]
+    fn old_window_default_migrates_to_monitor_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        assert_eq!(Settings::default().video.capture_mode, CaptureMode::Monitor);
+
+        // Written before versioning, with the old default.
+        std::fs::write(
+            &p,
+            r#"{"video":{"captureMode":"window","focusScreen":true}}"#,
+        )
+        .unwrap();
+        let s = Settings::load_or_default(&p);
+        assert_eq!(s.video.capture_mode, CaptureMode::Monitor);
+        assert_eq!(s.settings_version, SETTINGS_VERSION);
+
+        // Chosen explicitly afterwards: kept.
+        let mut s = s;
+        s.video.capture_mode = CaptureMode::Window;
+        s.save(&p).unwrap();
+        let s = Settings::load_or_default(&p);
+        assert_eq!(s.video.capture_mode, CaptureMode::Window);
     }
 
     #[test]

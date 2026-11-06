@@ -28,6 +28,8 @@ pub fn get_settings(state: St) -> Settings {
 pub fn save_settings(app: AppHandle, state: St, settings: Settings) -> CmdResult<Settings> {
     let mut new = settings;
     new.sanitize();
+    // Whatever the app saves reflects the user's current choices.
+    new.settings_version = gc_core::config::SETTINGS_VERSION;
     let prev = state.settings.read().clone();
     if new == prev {
         return Ok(new);
