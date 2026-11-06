@@ -122,6 +122,40 @@ pub fn delete_file(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Sets or clears the Windows "hidden" attribute (no-op elsewhere, where the
+/// leading dot already hides the file).
+pub fn set_hidden(path: &Path, hidden: bool) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    unsafe {
+        use crate::wstr::hstring;
+        use windows::Win32::Storage::FileSystem::{
+            GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN,
+            FILE_FLAGS_AND_ATTRIBUTES, INVALID_FILE_ATTRIBUTES,
+        };
+        let p = hstring(&path.to_string_lossy());
+        let cur = GetFileAttributesW(&p);
+        anyhow::ensure!(
+            cur != INVALID_FILE_ATTRIBUTES,
+            "cannot read attributes of {}",
+            path.display()
+        );
+        let new = if hidden {
+            cur | FILE_ATTRIBUTE_HIDDEN.0
+        } else {
+            cur & !FILE_ATTRIBUTE_HIDDEN.0
+        };
+        if new != cur {
+            SetFileAttributesW(&p, FILE_FLAGS_AND_ATTRIBUTES(new))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (path, hidden);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

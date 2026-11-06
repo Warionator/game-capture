@@ -138,6 +138,8 @@ fn encode_chunk_ring_remux_probe() {
             tags: meta.to_tags(),
             audio_titles: meta.audio_tracks.clone(),
             chapters_file: Some(chapters.to_string_lossy().into_owned()),
+            faststart: true,
+            ..Default::default()
         };
         let mut ff = Command::new("ffmpeg")
             .args(remux_args("pipe:0", &output, &remux))

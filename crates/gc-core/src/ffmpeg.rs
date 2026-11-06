@@ -761,6 +761,12 @@ pub struct RemuxSpec {
     pub audio_titles: Vec<String>,
     /// Path to an `ffmetadata` file with chapters (bookmarks).
     pub chapters_file: Option<String>,
+    /// Path to an `ffmetadata` file holding the global tags. When set it
+    /// replaces `tags` (which go on the command line and are length-limited).
+    pub metadata_file: Option<String>,
+    /// Move the MP4 index to the front (`+faststart`). This rewrites the
+    /// whole file after muxing, so it is only worth it for short clips.
+    pub faststart: bool,
 }
 
 /// `ffmpeg` arguments that read MPEG-TS from `input` (`pipe:0` for stdin)
@@ -772,18 +778,33 @@ pub fn remux_args(input: &str, output: &Path, spec: &RemuxSpec) -> Vec<String> {
         .collect();
     a.extend(["-fflags", "+genpts+discardcorrupt", "-f", "mpegts"].map(String::from));
     a.extend(["-i".to_string(), input.to_string()]);
+    let mut next_input = 1;
+    let mut chapters_input = None;
     if let Some(ch) = &spec.chapters_file {
         a.extend(["-f", "ffmetadata", "-i"].map(String::from));
         a.push(ch.clone());
+        chapters_input = Some(next_input);
+        next_input += 1;
+    }
+    let mut metadata_input = None;
+    if let Some(m) = &spec.metadata_file {
+        a.extend(["-f", "ffmetadata", "-i"].map(String::from));
+        a.push(m.clone());
+        metadata_input = Some(next_input);
     }
     a.extend(["-map", "0:v?", "-map", "0:a?", "-c", "copy"].map(String::from));
-    if spec.chapters_file.is_some() {
-        a.extend(["-map_chapters", "1"].map(String::from));
+    if let Some(i) = chapters_input {
+        a.push("-map_chapters".into());
+        a.push(i.to_string());
     }
-    a.extend(["-map_metadata", "-1", "-avoid_negative_ts", "make_zero"].map(String::from));
-    for (k, v) in &spec.tags {
-        a.push("-metadata".into());
-        a.push(format!("{k}={v}"));
+    a.push("-map_metadata".into());
+    a.push(metadata_input.map_or("-1".to_string(), |i| i.to_string()));
+    a.extend(["-avoid_negative_ts", "make_zero"].map(String::from));
+    if metadata_input.is_none() {
+        for (k, v) in &spec.tags {
+            a.push("-metadata".into());
+            a.push(format!("{k}={v}"));
+        }
     }
     for (i, t) in spec.audio_titles.iter().enumerate() {
         // MP4 keeps per-track names in the handler (`hdlr`) atom; Matroska
@@ -803,7 +824,12 @@ pub fn remux_args(input: &str, output: &Path, spec: &RemuxSpec) -> Vec<String> {
     if ext == "mkv" {
         a.extend(["-f", "matroska"].map(String::from));
     } else {
-        a.extend(["-movflags", "+faststart+use_metadata_tags", "-f", "mp4"].map(String::from));
+        let flags = if spec.faststart {
+            "+faststart+use_metadata_tags"
+        } else {
+            "+use_metadata_tags"
+        };
+        a.extend(["-movflags", flags, "-f", "mp4"].map(String::from));
     }
     a.push(output.to_string_lossy().into_owned());
     a
@@ -1403,6 +1429,8 @@ mod tests {
             tags: vec![("game_title".into(), "Fortnite".into())],
             audio_titles: vec!["Master".into(), "Game".into()],
             chapters_file: Some("ch.txt".into()),
+            faststart: true,
+            ..Default::default()
         };
         let a = remux_args("pipe:0", Path::new("out.mp4"), &spec);
         assert_eq!(
@@ -1417,6 +1445,26 @@ mod tests {
         let a = remux_args("in.ts", Path::new("out.MKV"), &RemuxSpec::default());
         assert!(a.windows(2).any(|w| w == ["-f", "matroska"]));
         assert!(!a.iter().any(|x| x == "-map_chapters"));
+        assert_eq!(arg_after(&a, "-map_metadata"), Some("-1"));
+
+        // Tags from a file, no faststart (live session muxing).
+        let spec = RemuxSpec {
+            tags: vec![("game_title".into(), "Fortnite".into())],
+            metadata_file: Some("meta.txt".into()),
+            ..Default::default()
+        };
+        let a = remux_args("pipe:0", Path::new("out.mp4"), &spec);
+        assert_eq!(arg_after(&a, "-movflags"), Some("+use_metadata_tags"));
+        assert_eq!(arg_after(&a, "-map_metadata"), Some("1"));
+        assert!(!a.iter().any(|x| x == "-metadata"));
+        let spec = RemuxSpec {
+            chapters_file: Some("ch.txt".into()),
+            metadata_file: Some("meta.txt".into()),
+            ..Default::default()
+        };
+        let a = remux_args("pipe:0", Path::new("out.mp4"), &spec);
+        assert_eq!(arg_after(&a, "-map_chapters"), Some("1"));
+        assert_eq!(arg_after(&a, "-map_metadata"), Some("2"));
     }
 
     #[test]

@@ -1239,6 +1239,8 @@ impl Worker {
                     tags: meta.to_tags(),
                     audio_titles: meta.audio_tracks.clone(),
                     chapters_file,
+                    faststart: true,
+                    ..Default::default()
                 };
                 let child = ff.spawn_remux(&out, &spec)?;
                 let r = Ffmpeg::finish_remux(child, |w| {
@@ -1332,7 +1334,7 @@ impl Worker {
         );
         let game = meta.game_title.clone();
         let titles = meta.audio_tracks.clone();
-        match SessionWriter::create(out, meta, titles) {
+        match SessionWriter::create(out, meta, titles, self.ff.as_ref()) {
             Ok(w) => {
                 *p.shared.session.lock() = Some(w);
                 drop(guard);
