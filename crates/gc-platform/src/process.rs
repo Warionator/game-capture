@@ -509,11 +509,30 @@ mod imp {
         }
     }
 
-    /// Largest visible top-level window of a process.
+    /// Hidden by DWM although `IsWindowVisible` says otherwise (suspended
+    /// UWP frames, windows on another virtual desktop, some launchers).
+    fn is_cloaked(hwnd: HWND) -> bool {
+        use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+        let mut cloaked = 0u32;
+        unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAKED,
+                &mut cloaked as *mut u32 as *mut _,
+                std::mem::size_of::<u32>() as u32,
+            )
+            .is_ok()
+                && cloaked != 0
+        }
+    }
+
+    /// Largest visible, uncloaked top-level window of a process. Games often
+    /// show a small launcher/splash window first, so callers that hold on
+    /// to the result should check again later (see the capture engine).
     pub fn main_window(pid: u32) -> Option<isize> {
         top_level_windows()
             .into_iter()
-            .filter(|(_, p)| *p == pid)
+            .filter(|(h, p)| *p == pid && !is_cloaked(*h))
             .max_by_key(|(h, _)| unsafe {
                 let mut r = RECT::default();
                 let _ = GetWindowRect(*h, &mut r);

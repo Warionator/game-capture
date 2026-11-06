@@ -218,7 +218,10 @@ pub fn init(app: &AppHandle, minimized: bool) -> anyhow::Result<()> {
                                 pid: g.pid,
                                 exe_name: g.exe_name.clone(),
                                 display_name: g.display_name.clone(),
-                                hwnd: gc_platform::process::main_window(g.pid),
+                                // Resolved by the engine each time capture
+                                // starts: at launch this is often still a
+                                // launcher/splash window (e.g. CoD "Game HQ").
+                                hwnd: None,
                             };
                             state.engine(|e| e.set_game(Some(ctx)));
                             let _ = app.emit("game", Some(g));

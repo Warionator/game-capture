@@ -253,6 +253,8 @@ impl CaptureEngine {
             capture_label: None,
             replay_quality: None,
             announced: None,
+            capture_window: None,
+            window_change: None,
         };
         let thread = std::thread::Builder::new()
             .name("gc-capture-engine".into())
@@ -461,7 +463,19 @@ struct Worker {
     replay_quality: Option<Quality>,
     /// Game (pid) the "capture ready" popup was shown for.
     announced: Option<u32>,
+    /// Game window (handle, client size) the running replay pipeline was
+    /// started for.
+    capture_window: Option<GameWindow>,
+    /// A different game window seen by consecutive ticks, and how many.
+    window_change: Option<(GameWindow, u8)>,
 }
+
+/// A game's main window handle and its client size.
+type GameWindow = (isize, (u32, u32));
+
+/// Consecutive 1 s ticks a new game window must persist before capture
+/// switches to it (rides out loading screens and mode switches).
+const WINDOW_SWITCH_TICKS: u8 = 3;
 
 struct Target {
     video: VideoSource,
@@ -588,6 +602,7 @@ impl Worker {
                     return;
                 }
                 self.degraded = false;
+                self.window_change = None;
                 if self.is_recording() && !ended {
                     // Switched games mid-recording: keep recording.
                     return;
@@ -794,6 +809,68 @@ impl Worker {
         {
             self.start_pipeline();
         }
+        self.check_game_window();
+    }
+
+    /// The game's current main window and its client size.
+    #[cfg(windows)]
+    fn current_game_window(&self) -> Option<GameWindow> {
+        let g = self.game.as_ref()?;
+        let h = g
+            .hwnd
+            .or_else(|| gc_platform::process::main_window(g.pid))?;
+        let size = gc_platform::display::window_client_size(h)?;
+        Some((h, size))
+    }
+    #[cfg(not(windows))]
+    fn current_game_window(&self) -> Option<GameWindow> {
+        None
+    }
+
+    /// Restarts capture when the game's main window changed since capture
+    /// started: many games open a small launcher/splash window first (CoD
+    /// "Game HQ"), and window capture is locked to one window and size.
+    fn check_game_window(&mut self) {
+        let running = self.replay.lock().is_some() || self.recorder.lock().is_some();
+        let now = if running {
+            self.current_game_window()
+        } else {
+            None
+        };
+        // No usable window right now (minimised, closing): keep going.
+        let Some(now) = now.filter(|w| self.capture_window != Some(*w)) else {
+            self.window_change = None;
+            return;
+        };
+        let seen = match self.window_change {
+            Some((w, n)) if w == now => n + 1,
+            _ => 1,
+        };
+        if seen < WINDOW_SWITCH_TICKS {
+            self.window_change = Some((now, seen));
+            return;
+        }
+        self.window_change = None;
+        let old = self.capture_window;
+        log::info!(
+            "game window changed ({old:?} -> {now:?}); restarting capture on the new window"
+        );
+        if old.is_none_or(|(h, _)| h != now.0) {
+            // A new window may capture fine where the old one stalled.
+            self.degraded = false;
+        }
+        let was_recording = self.is_recording();
+        self.stop_pipeline(true);
+        if self.wants_pipeline() {
+            self.start_pipeline();
+        }
+        if was_recording {
+            self.start_recording();
+            self.notice(
+                false,
+                "The game window changed; the recording continues in a new file",
+            );
+        }
     }
 
     /// Capture sources to try, best first: the game window itself (Windows
@@ -930,6 +1007,7 @@ impl Worker {
         let (caps, probed) = self.probe.read().clone().unwrap_or_default();
 
         let s = self.settings.clone();
+        let window = self.current_game_window();
         let targets = self.resolve_targets(&caps);
         let font = Self::focus_font(&caps);
         let audio = AudioPlan {
@@ -1007,6 +1085,8 @@ impl Worker {
                                 }
                                 self.current_encoder = Some((backend, codec));
                                 self.capture_label = Some(target.label);
+                                self.capture_window = window;
+                                self.window_change = None;
                                 return Ok(p);
                             }
                             Err(e) => {
