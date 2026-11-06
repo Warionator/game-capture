@@ -463,15 +463,15 @@ struct Worker {
     replay_quality: Option<Quality>,
     /// Game (pid) the "capture ready" popup was shown for.
     announced: Option<u32>,
-    /// Game window (handle, client size) the running replay pipeline was
-    /// started for.
+    /// Game window the running pipeline was started for.
     capture_window: Option<GameWindow>,
     /// A different game window seen by consecutive ticks, and how many.
     window_change: Option<(GameWindow, u8)>,
 }
 
-/// A game's main window handle and its client size.
-type GameWindow = (isize, (u32, u32));
+/// A game's main window: handle, client size and, when capture follows the
+/// window's position on the monitor (Desktop Duplication), its rectangle.
+type GameWindow = (isize, (u32, u32), Option<(i32, i32, u32, u32)>);
 
 /// Consecutive 1 s ticks a new game window must persist before capture
 /// switches to it (rides out loading screens and mode switches).
@@ -812,28 +812,36 @@ impl Worker {
         self.check_game_window();
     }
 
-    /// The game's current main window and its client size.
+    /// The game's current main window and its client size, plus its
+    /// rectangle on the monitor when `with_rect`.
     #[cfg(windows)]
-    fn current_game_window(&self) -> Option<GameWindow> {
+    fn current_game_window(&self, with_rect: bool) -> Option<GameWindow> {
+        use gc_platform::display::{window_client_size, window_placement};
         let g = self.game.as_ref()?;
         let h = g
             .hwnd
             .or_else(|| gc_platform::process::main_window(g.pid))?;
-        let size = gc_platform::display::window_client_size(h)?;
-        Some((h, size))
+        let size = window_client_size(h)?;
+        let rect = with_rect
+            .then(|| window_placement(h).map(|p| p.rect))
+            .flatten();
+        Some((h, size, rect))
     }
     #[cfg(not(windows))]
-    fn current_game_window(&self) -> Option<GameWindow> {
+    fn current_game_window(&self, _with_rect: bool) -> Option<GameWindow> {
         None
     }
 
     /// Restarts capture when the game's main window changed since capture
     /// started: many games open a small launcher/splash window first (CoD
-    /// "Game HQ"), and window capture is locked to one window and size.
+    /// "Game HQ"), window capture is locked to one window and size, and
+    /// monitor capture to the rectangle the window had (games often create
+    /// their window off-centre and move it to 0,0 a moment later).
     fn check_game_window(&mut self) {
         let running = self.replay.lock().is_some() || self.recorder.lock().is_some();
         let now = if running {
-            self.current_game_window()
+            let with_rect = self.capture_window.is_some_and(|w| w.2.is_some());
+            self.current_game_window(with_rect)
         } else {
             None
         };
@@ -855,7 +863,7 @@ impl Worker {
         log::info!(
             "game window changed ({old:?} -> {now:?}); restarting capture on the new window"
         );
-        if old.is_none_or(|(h, _)| h != now.0) {
+        if old.is_none_or(|(h, _, _)| h != now.0) {
             // A new window may capture fine where the old one stalled.
             self.degraded = false;
         }
@@ -1007,7 +1015,7 @@ impl Worker {
         let (caps, probed) = self.probe.read().clone().unwrap_or_default();
 
         let s = self.settings.clone();
-        let window = self.current_game_window();
+        let window = self.current_game_window(true);
         let targets = self.resolve_targets(&caps);
         let font = Self::focus_font(&caps);
         let audio = AudioPlan {
@@ -1085,7 +1093,12 @@ impl Worker {
                                 }
                                 self.current_encoder = Some((backend, codec));
                                 self.capture_label = Some(target.label);
-                                self.capture_window = window;
+                                // Only monitor capture depends on where the
+                                // window is.
+                                let follows_rect =
+                                    matches!(target.video, VideoSource::Ddagrab { .. });
+                                self.capture_window =
+                                    window.map(|(h, s, r)| (h, s, r.filter(|_| follows_rect)));
                                 self.window_change = None;
                                 return Ok(p);
                             }
