@@ -547,7 +547,10 @@ mod tests {
             ("Godot_v4.3-stable_win64.exe", "Godot Engine"),
             ("wallpaper64.exe", "wallpaper_engine"),
         ] {
-            let f = facts(exe, &format!(r"C:\SteamLibrary\steamapps\common\{dir}\{exe}"));
+            let f = facts(
+                exe,
+                &format!(r"C:\SteamLibrary\steamapps\common\{dir}\{exe}"),
+            );
             assert_eq!(classify(&f, &cfg), Verdict::NotAGame, "{exe}");
         }
     }
