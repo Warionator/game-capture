@@ -1037,18 +1037,20 @@ impl Worker {
             } else {
                 &[false]
             };
-            for &zero_copy in zc_variants {
-                for target in &targets {
-                    let focus_variants: &[bool] = if s.video.focus_screen
-                        && target.focus_ok
-                        && !self.degraded
-                        && game_pid.is_some()
-                    {
-                        &[true, false]
-                    } else {
-                        &[false]
-                    };
-                    for &focus in focus_variants {
+            // The focus screen outranks zero-copy: losing it shows whatever
+            // the player alt-tabs to, losing zero-copy only costs some GPU.
+            for target in &targets {
+                let focus_variants: &[bool] = if s.video.focus_screen
+                    && target.focus_ok
+                    && !self.degraded
+                    && game_pid.is_some()
+                {
+                    &[true, false]
+                } else {
+                    &[false]
+                };
+                for &focus in focus_variants {
+                    for &zero_copy in zc_variants {
                         let spec = PipelineSpec {
                             video: target.video.clone(),
                             source_size: target.size,

@@ -208,8 +208,11 @@ impl Pipeline {
                 .spawn(move || {
                     for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                         let line = line.trim().to_string();
-                        // Echo of the interactive focus-screen command.
-                        if line.is_empty() || line.starts_with("Enter command:") {
+                        // Echo of / reply to the interactive focus-screen command.
+                        if line.is_empty()
+                            || line.starts_with("Enter command:")
+                            || line.starts_with("Command reply for stream")
+                        {
                             continue;
                         }
                         log::warn!("ffmpeg: {line}");

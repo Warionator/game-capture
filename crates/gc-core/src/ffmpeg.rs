@@ -105,6 +105,8 @@ pub fn parse_encoder_list(output: &str) -> Vec<String> {
 }
 
 /// Parses `ffmpeg -hide_banner -filters` output into filter names.
+/// The flag column is three characters (`TSC`) up to FFmpeg 7 and two
+/// (`TS`) from FFmpeg 8.
 pub fn parse_filter_list(output: &str) -> Vec<String> {
     output
         .lines()
@@ -113,7 +115,9 @@ pub fn parse_filter_list(output: &str) -> Vec<String> {
             let flags = it.next()?;
             let name = it.next()?;
             let io = it.next()?;
-            (flags.len() == 3 && io.contains("->")).then(|| name.to_string())
+            let flags_ok = (2..=3).contains(&flags.len())
+                && flags.chars().all(|c| matches!(c, 'T' | 'S' | 'C' | '.'));
+            (flags_ok && io.contains("->")).then(|| name.to_string())
         })
         .collect()
 }
@@ -279,7 +283,18 @@ impl PipelineSpec {
             && self.backend.is_hardware()
             && self.video.is_gpu()
             && (!self.needs_scale() || self.gpu_scaler.is_some() || self.focus_screen.is_some())
-            && (self.focus_screen.is_none() || self.has_scale_d3d11)
+            && (self.focus_screen.is_none()
+                || self.has_scale_d3d11
+                || !self.focus_needs_normalize())
+    }
+
+    /// Whether the zero-copy focus switch must re-render both sources into
+    /// one D3D11 pool (`scale_d3d11`). NVENC encodes textures from mixed
+    /// pools directly, so it only needs that when scaling; this matters
+    /// because `scale_d3d11` fails to allocate its output on some FFmpeg 8
+    /// builds.
+    fn focus_needs_normalize(&self) -> bool {
+        self.backend != Backend::Nvenc || self.needs_scale()
     }
 
     fn needs_scale(&self) -> bool {
@@ -385,11 +400,16 @@ impl PipelineSpec {
                 None => format!("{src}[v]"),
             },
             None => format!("{src}{download},{}[v]", self.cpu_tail()),
-            Some(f) if zero_copy => format!(
-                "{src}[cap];{}[fs];[cap][fs]streamselect=inputs=2:map=0{fps},{}[v]",
-                self.focus_source(f, true),
-                self.gpu_tail(true).expect("normalized tail")
-            ),
+            Some(f) if zero_copy => {
+                let tail = self
+                    .gpu_tail(self.focus_needs_normalize())
+                    .map(|t| format!(",{t}"))
+                    .unwrap_or_default();
+                format!(
+                    "{src}[cap];{}[fs];[cap][fs]streamselect=inputs=2:map=0{fps}{tail}[v]",
+                    self.focus_source(f, true),
+                )
+            }
             Some(f) => format!(
                 "{src}{download}[cap];{}[fs];[cap][fs]streamselect=inputs=2:map=0{fps},{}[v]",
                 self.focus_source(f, false),
@@ -448,11 +468,17 @@ impl PipelineSpec {
                 hwnd, draw_mouse, ..
             } => {
                 let (w, h) = self.source_size;
-                format!(
-                    "gfxcapture=hwnd={hwnd}:max_framerate={rate}:capture_cursor={}:width={w}:height={h}:resize_mode=scale_aspect:dup_frames={}",
+                // gfxcapture only emits a frame when the window repaints
+                // (FFmpeg 8 has no `dup_frames`), so `fps` makes the rate
+                // constant when it is capped.
+                let mut src = format!(
+                    "gfxcapture=hwnd={hwnd}:max_framerate={rate}:capture_cursor={}:width={w}:height={h}:resize_mode=scale_aspect",
                     u8::from(*draw_mouse),
-                    u8::from(!self.fps.is_uncapped())
-                )
+                );
+                if !self.fps.is_uncapped() {
+                    src.push_str(&format!(",fps={}", self.fps.0));
+                }
+                src
             }
             VideoSource::TestPattern => {
                 let (w, h) = self.source_size;
@@ -1317,20 +1343,32 @@ mod tests {
         s.focus_screen = Some(FocusScreen {
             font_file: Some(r"C:\Windows\Fonts\segoeui.ttf".into()),
         });
-        // Without scale_d3d11 the two frame sources cannot share the GPU path.
-        assert!(!s.is_zero_copy());
-        s.has_scale_d3d11 = true;
+        // NVENC encodes both frame sources directly when not scaling: no
+        // scale_d3d11 needed (it fails to allocate on some FFmpeg 8 builds).
         assert!(s.is_zero_copy());
         let a = s.build_args();
         assert_eq!(arg_after(&a, "-init_hw_device"), Some("d3d11va=gc"));
         let fc = arg_after(&a, "-filter_complex").unwrap();
         assert!(fc.starts_with(
-            "gfxcapture=hwnd=4660:max_framerate=60:capture_cursor=0:width=1920:height=1080:resize_mode=scale_aspect:dup_frames=1[cap];"
+            "gfxcapture=hwnd=4660:max_framerate=60:capture_cursor=0:width=1920:height=1080:resize_mode=scale_aspect,fps=60[cap];"
         ), "{fc}");
+        assert!(!fc.contains("dup_frames"), "{fc}");
         assert!(fc.contains("color=c=0x0b0d12:s=1920x1080:r=1,drawtext=fontfile='C\\:/Windows/Fonts/segoeui.ttf'"), "{fc}");
         assert!(fc.contains(",format=bgra,hwupload[fs];"), "{fc}");
-        assert!(fc.contains("[cap][fs]streamselect=inputs=2:map=0,fps=60,scale_d3d11=width=1920:height=1080:format=nv12[v]"), "{fc}");
+        assert!(
+            fc.contains("[cap][fs]streamselect=inputs=2:map=0,fps=60[v]"),
+            "{fc}"
+        );
         assert_eq!(focus_command(true), "cstreamselect -1 map 1\n");
+
+        // Other encoders (and scaling) re-render into one pool first.
+        s.backend = Backend::Amf;
+        assert!(!s.is_zero_copy());
+        s.has_scale_d3d11 = true;
+        assert!(s.is_zero_copy());
+        let args = s.build_args();
+        let fc = arg_after(&args, "-filter_complex").unwrap();
+        assert!(fc.contains("[cap][fs]streamselect=inputs=2:map=0,fps=60,scale_d3d11=width=1920:height=1080:format=nv12[v]"), "{fc}");
     }
 
     #[test]
@@ -1473,6 +1511,9 @@ mod tests {
         assert_eq!(parse_encoder_list(enc), ["h264_nvenc", "aac"]);
         let flt = "Filters:\n  T.. = Timeline support\n ... abench            A->A       Benchmark part of a filtergraph.\n ... scale_d3d11       V->V       Scale video using Direct3D11\n";
         assert_eq!(parse_filter_list(flt), ["abench", "scale_d3d11"]);
+        // FFmpeg 8: two flag characters; source filters have `|` inputs.
+        let flt8 = "Filters:\n  T.. = Timeline support\n  A = Audio input/output\n ------\n TS aap               AA->A      Apply Affine Projection.\n .. gfxcapture        |->V       Capture graphics/screen content as a video source\n T. drawtext          V->V       Draw text on top of video frames.\n";
+        assert_eq!(parse_filter_list(flt8), ["aap", "gfxcapture", "drawtext"]);
     }
 
     #[test]
