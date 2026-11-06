@@ -113,7 +113,7 @@ pub use stub::*;
 mod imp {
     use super::*;
     use crate::wstr::{from_wide, hstring, wide};
-    use gc_core::detect::is_graphics_module;
+    use gc_core::detect::is_tracked_module;
     use std::collections::HashMap;
     use windows::core::{BOOL, PCWSTR, PWSTR};
     use windows::Win32::Foundation::{
@@ -199,9 +199,10 @@ mod imp {
         Some(String::from_utf16_lossy(&buf[..len as usize]))
     }
 
-    /// Graphics DLLs loaded in `pid`, or `None` if the module list is not
-    /// readable (protected / anti-cheat processes, or 32↔64-bit edge cases).
-    fn graphics_modules(pid: u32) -> Option<Vec<String>> {
+    /// Graphics and game-engine DLLs loaded in `pid`, or `None` if the module
+    /// list is not readable (protected / anti-cheat processes, or 32↔64-bit
+    /// edge cases).
+    fn tracked_modules(pid: u32) -> Option<Vec<String>> {
         unsafe {
             let snap =
                 CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid).ok()?;
@@ -214,7 +215,7 @@ mod imp {
             Module32FirstW(snap.0, &mut e).ok()?;
             loop {
                 let name = from_wide(&e.szModule);
-                if is_graphics_module(&name) {
+                if is_tracked_module(&name) {
                     found.push(name);
                 }
                 if Module32NextW(snap.0, &mut e).is_err() {
@@ -355,13 +356,32 @@ mod imp {
         ProcessFacts {
             pid,
             exe_name: exe_name.to_string(),
+            known_game: exe_path.as_deref().is_some_and(is_windows_known_game),
             exe_path,
             display_name,
-            graphics_modules: graphics_modules(pid),
+            modules: tracked_modules(pid),
             is_foreground: fg.is_some(),
             is_fullscreen: fg.is_some_and(|f| f.fullscreen),
             is_packaged,
         }
+    }
+
+    /// Whether Windows' Game Bar lists `path` as a game. The registry list
+    /// is re-read at most every few seconds; Windows adds a game to it
+    /// shortly after the game starts.
+    fn is_windows_known_game(path: &str) -> bool {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+        const REFRESH: Duration = Duration::from_secs(10);
+        static CACHE: Mutex<Option<(Instant, HashSet<String>)>> = Mutex::new(None);
+        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.as_ref().is_none_or(|(t, _)| t.elapsed() > REFRESH) {
+            *cache = Some((Instant::now(), crate::system::windows_known_games()));
+        }
+        cache
+            .as_ref()
+            .is_some_and(|(_, set)| set.contains(&path.to_lowercase()))
     }
 
     /// Converts an HICON into RGBA PNG bytes.

@@ -17,9 +17,13 @@ pub struct ProcessFacts {
     pub exe_path: Option<String>,
     /// File description / product name / package display name.
     pub display_name: Option<String>,
-    /// Graphics API DLLs loaded (`d3d11.dll`, `d3d12.dll`, `vulkan-1.dll`…).
+    /// Loaded modules that matter for detection: graphics APIs
+    /// (`d3d11.dll`, `vulkan-1.dll`…) and game engines/SDKs
+    /// (`UnityPlayer.dll`, `steam_api64.dll`…), see [`is_tracked_module`].
     /// `None` when the module list could not be read (protected process).
-    pub graphics_modules: Option<Vec<String>>,
+    pub modules: Option<Vec<String>>,
+    /// Windows (Game Bar) has recognised this executable as a game.
+    pub known_game: bool,
     /// Owns the foreground window.
     pub is_foreground: bool,
     /// Foreground window covers its whole monitor (exclusive or borderless).
@@ -129,7 +133,73 @@ const NOT_GAMES: &[&str] = &[
     "steelseriesengine.exe",
     "rtss.exe",
     "msiafterburner.exe",
+    // Video players and streaming apps: fullscreen D3D video looks a lot
+    // like a game.
+    "stremio.exe",
+    "stremio-shell-ng.exe",
+    "stremio-runtime.exe",
+    "mpv.exe",
+    "mpc-hc.exe",
+    "mpc-be64.exe",
+    "mpc-be.exe",
+    "potplayer.exe",
+    "potplayer64.exe",
+    "potplayermini.exe",
+    "potplayermini64.exe",
+    "kmplayer.exe",
+    "kmplayer64x.exe",
+    "wmplayer.exe",
+    "microsoft.media.player.exe",
+    "video.ui.exe",
+    "kodi.exe",
+    "plex.exe",
+    "plex htpc.exe",
+    "jellyfin media player.exe",
+    "jellyfinmediaplayer.exe",
+    "smplayer.exe",
+    "netflix.exe",
+    // Video editors.
+    "resolve.exe",
+    "adobe premiere pro.exe",
+    "afterfx.exe",
+    "capcut.exe",
+    "vegas.exe",
+    "vegas200.exe",
+    "vegas210.exe",
+    "vegas220.exe",
+    "handbrake.exe",
+    "shotcut.exe",
+    "kdenlive.exe",
+    "clipchamp.exe",
+    // Engine editors and creative tools (several are sold on Steam, so they
+    // sit in `steamapps\common` like games do).
+    "ue4editor.exe",
+    "unity hub.exe",
+    "gamemaker.exe",
+    "rpgmv.exe",
+    "rpgmz.exe",
+    "aseprite.exe",
+    "krita.exe",
+    "substance painter.exe",
+    "adobe substance 3d painter.exe",
+    "wallpaper32.exe",
+    "wallpaper64.exe",
+    "lossless scaling.exe",
+    "losslessscaling.exe",
+    "vrserver.exe",
+    "vrmonitor.exe",
+    "vrcompositor.exe",
+    "vrdashboard.exe",
+    "soundpad.exe",
+    // Launchers that Windows sometimes lists as games.
+    "leagueclient.exe",
+    "leagueclientux.exe",
 ];
+
+/// Executable name prefixes that are never games. Godot ships its editor
+/// (which also runs projects) as `godot*.exe`, e.g. the Steam build's
+/// `godot.windows.opt.tools.64.exe`; exported games are named after the game.
+const NOT_GAME_PREFIXES: &[&str] = &["godot", "unrealeditor"];
 
 /// Words in a program's description that mark it as a capture/screenshot
 /// tool rather than a game.
@@ -155,18 +225,18 @@ pub fn is_capture_tool(display_name: Option<&str>) -> bool {
     })
 }
 
-/// Path fragments that strongly suggest a game install.
-const GAME_PATHS: &[&str] = &[
+/// Game launcher library folders: anything installed here is (almost always)
+/// a game.
+const LAUNCHER_PATHS: &[&str] = &[
     "\\steamapps\\common\\",
     "\\epic games\\",
     "\\xboxgames\\",
     "\\riot games\\",
     "\\gog galaxy\\games\\",
+    "\\gog games\\",
     "\\ubisoft game launcher\\games\\",
     "\\ea games\\",
-    "\\battle.net\\",
     "\\origin games\\",
-    "\\games\\",
 ];
 
 const GRAPHICS_DLLS: &[&str] = &[
@@ -175,6 +245,51 @@ const GRAPHICS_DLLS: &[&str] = &[
     "d3d12.dll",
     "vulkan-1.dll",
     "opengl32.dll",
+];
+
+/// Modules only games (and emulators) load: engine runtimes, store SDKs,
+/// anti-cheat, game middleware and upscalers. Browsers, video players and
+/// editors load the graphics APIs above but none of these.
+const GAME_DLLS: &[&str] = &[
+    // Engines
+    "unityplayer.dll",
+    "gameassembly.dll",
+    // Store / platform SDKs
+    "steam_api.dll",
+    "steam_api64.dll",
+    "eossdk-win32-shipping.dll",
+    "eossdk-win64-shipping.dll",
+    "galaxy.dll",
+    "galaxy64.dll",
+    "discord_game_sdk.dll",
+    // Anti-cheat
+    "easyanticheat.dll",
+    "easyanticheat_x64.dll",
+    "easyanticheat_eos.dll",
+    "beclient.dll",
+    "beclient_x64.dll",
+    // Middleware
+    "fmod.dll",
+    "fmod64.dll",
+    "fmodstudio.dll",
+    "fmodstudio64.dll",
+    "binkw32.dll",
+    "binkw64.dll",
+    "bink2w32.dll",
+    "bink2w64.dll",
+    "physx3_x64.dll",
+    "physx3_x86.dll",
+    "physx_64.dll",
+    "physxcommon_64.dll",
+    "sdl2.dll",
+    "sdl3.dll",
+    // Upscalers / frame generation
+    "nvngx_dlss.dll",
+    "nvngx_dlssg.dll",
+    "sl.interposer.dll",
+    "amd_fidelityfx_dx12.dll",
+    "amd_fidelityfx_vk.dll",
+    "libxess.dll",
 ];
 
 /// Chromium-based browsers that host installed web apps (PWAs), with the
@@ -223,11 +338,39 @@ pub fn is_graphics_module(name: &str) -> bool {
     GRAPHICS_DLLS.iter().any(|d| d.eq_ignore_ascii_case(name))
 }
 
-fn path_looks_like_game(path: &str) -> bool {
-    let p = path.to_ascii_lowercase().replace('/', "\\");
-    GAME_PATHS.iter().any(|g| p.contains(g))
+pub fn is_game_module(name: &str) -> bool {
+    GAME_DLLS.iter().any(|d| d.eq_ignore_ascii_case(name))
 }
 
+/// Modules worth recording in [`ProcessFacts::modules`].
+pub fn is_tracked_module(name: &str) -> bool {
+    is_graphics_module(name) || is_game_module(name)
+}
+
+fn normalized_path(path: &str) -> String {
+    path.to_ascii_lowercase().replace('/', "\\")
+}
+
+fn in_launcher_library(path: &str) -> bool {
+    let p = normalized_path(path);
+    LAUNCHER_PATHS.iter().any(|g| p.contains(g))
+}
+
+fn is_known_non_game(exe_lower: &str) -> bool {
+    NOT_GAMES.contains(&exe_lower) || NOT_GAME_PREFIXES.iter().any(|p| exe_lower.starts_with(p))
+}
+
+/// Decides whether a process is a game.
+///
+/// Rendering with D3D/Vulkan/OpenGL in a fullscreen window is *not* enough
+/// on its own: browsers, video players and editors all do that. An
+/// auto-detected game needs positive evidence:
+///
+/// * **Strong** – Windows lists it as a game, or it is installed in a game
+///   launcher's library. Enough while it is in the foreground.
+/// * **Weak** – it loads a game engine/SDK/anti-cheat module, is an Unreal
+///   `-Shipping` build, lives under a `Games` folder, or is a packaged app
+///   whose modules can't be read. Needs a fullscreen foreground window too.
 pub fn classify(facts: &ProcessFacts, cfg: &GameSettings) -> Verdict {
     let exe = facts.exe_name.to_ascii_lowercase();
     if cfg.custom.iter().any(|g| {
@@ -241,43 +384,36 @@ pub fn classify(facts: &ProcessFacts, cfg: &GameSettings) -> Verdict {
     }
     if !cfg.auto_detect
         || cfg.excluded.iter().any(|e| e.eq_ignore_ascii_case(&exe))
-        || NOT_GAMES.contains(&exe.as_str())
+        || is_known_non_game(&exe)
         || is_capture_tool(facts.display_name.as_deref())
     {
         return Verdict::NotAGame;
     }
-    if let Some(path) = &facts.exe_path {
-        let p = path.to_ascii_lowercase();
-        if p.contains("\\windows\\system32\\") || p.contains("\\windows\\systemapps\\") {
-            return Verdict::NotAGame;
-        }
+    let path = facts.exe_path.as_deref().map(normalized_path);
+    if path.as_deref().is_some_and(|p| {
+        p.contains("\\windows\\system32\\") || p.contains("\\windows\\systemapps\\")
+    }) {
+        return Verdict::NotAGame;
+    }
+    if !facts.is_foreground {
+        return Verdict::NotAGame;
+    }
+    let modules = facts.modules.as_deref();
+    // Module list readable: a game must load a graphics API. Unreadable
+    // (often anti-cheat protected): rely on the other signals.
+    if modules.is_some_and(|m| !m.iter().any(|d| is_graphics_module(d))) {
+        return Verdict::NotAGame;
     }
 
-    let in_game_dir = facts.exe_path.as_deref().is_some_and(path_looks_like_game);
-    let renders = facts
-        .graphics_modules
-        .as_ref()
-        .map(|m| m.iter().any(|d| is_graphics_module(d)));
-    let fullscreen_fg = facts.is_foreground && facts.is_fullscreen;
-
-    let score = match renders {
-        // Module list readable: require a graphics API.
-        Some(true) => {
-            if fullscreen_fg || in_game_dir {
-                2
-            } else {
-                0
-            }
-        }
-        Some(false) => 0,
-        // Unreadable (often anti-cheat protected) – rely on other signals.
-        None => {
-            u8::from(in_game_dir)
-                + u8::from(fullscreen_fg)
-                + u8::from(facts.is_packaged && fullscreen_fg)
-        }
-    };
-    if score >= 2 {
+    let strong = facts.known_game || path.as_deref().is_some_and(in_launcher_library);
+    if strong {
+        return Verdict::Detected;
+    }
+    let weak = modules.is_some_and(|m| m.iter().any(|d| is_game_module(d)))
+        || exe.contains("-shipping")
+        || path.as_deref().is_some_and(|p| p.contains("\\games\\"))
+        || (facts.is_packaged && modules.is_none());
+    if weak && facts.is_fullscreen {
         Verdict::Detected
     } else {
         Verdict::NotAGame
@@ -354,7 +490,7 @@ mod tests {
             pid: 1,
             exe_name: exe.into(),
             exe_path: Some(path.into()),
-            graphics_modules: Some(vec!["d3d12.dll".into()]),
+            modules: Some(vec!["d3d12.dll".into()]),
             is_foreground: true,
             is_fullscreen: true,
             ..Default::default()
@@ -382,8 +518,64 @@ mod tests {
         let mut f = facts("tool.exe", r"C:\Tools\tool.exe");
         f.is_fullscreen = false;
         assert_eq!(classify(&f, &cfg), Verdict::NotAGame);
-        f.graphics_modules = Some(vec![]);
+        f.modules = Some(vec![]);
         f.is_fullscreen = true;
+        assert_eq!(classify(&f, &cfg), Verdict::NotAGame);
+    }
+
+    #[test]
+    fn fullscreen_rendering_alone_is_not_a_game() {
+        let cfg = GameSettings::default();
+        // A video player / streaming app showing fullscreen video.
+        let f = facts(
+            "SomeVideoApp.exe",
+            r"C:\Users\me\AppData\Local\Programs\SomeVideoApp\SomeVideoApp.exe",
+        );
+        assert_eq!(classify(&f, &cfg), Verdict::NotAGame);
+        let f = facts(
+            "stremio-shell-ng.exe",
+            r"C:\Users\me\AppData\Local\Programs\LNV\Stremio-4\stremio-shell-ng.exe",
+        );
+        assert_eq!(classify(&f, &cfg), Verdict::NotAGame);
+    }
+
+    #[test]
+    fn steam_software_is_not_a_game() {
+        let cfg = GameSettings::default();
+        for (exe, dir) in [
+            ("godot.windows.opt.tools.64.exe", "Godot Engine"),
+            ("Godot_v4.3-stable_win64.exe", "Godot Engine"),
+            ("wallpaper64.exe", "wallpaper_engine"),
+        ] {
+            let f = facts(exe, &format!(r"C:\SteamLibrary\steamapps\common\{dir}\{exe}"));
+            assert_eq!(classify(&f, &cfg), Verdict::NotAGame, "{exe}");
+        }
+    }
+
+    #[test]
+    fn windows_known_games_detected_even_windowed() {
+        let cfg = GameSettings::default();
+        let mut f = facts("Dolphin.exe", r"F:\Dolphin-x64\Dolphin.exe");
+        f.is_fullscreen = false;
+        assert_eq!(classify(&f, &cfg), Verdict::NotAGame);
+        f.known_game = true;
+        assert_eq!(classify(&f, &cfg), Verdict::Detected);
+        // Still needs to be in the foreground.
+        f.is_foreground = false;
+        assert_eq!(classify(&f, &cfg), Verdict::NotAGame);
+    }
+
+    #[test]
+    fn engine_modules_need_fullscreen() {
+        let cfg = GameSettings::default();
+        let mut f = facts("MyIndieGame.exe", r"C:\itch\MyIndieGame\MyIndieGame.exe");
+        f.modules = Some(vec!["d3d11.dll".into(), "UnityPlayer.dll".into()]);
+        assert_eq!(classify(&f, &cfg), Verdict::Detected);
+        f.is_fullscreen = false;
+        assert_eq!(classify(&f, &cfg), Verdict::NotAGame);
+        // An engine module without any graphics API isn't rendering.
+        f.is_fullscreen = true;
+        f.modules = Some(vec!["steam_api64.dll".into()]);
         assert_eq!(classify(&f, &cfg), Verdict::NotAGame);
     }
 
@@ -394,7 +586,7 @@ mod tests {
             "FortniteClient-Win64-Shipping.exe",
             r"C:\Program Files\Epic Games\Fortnite\FortniteGame\Binaries\Win64\FortniteClient-Win64-Shipping.exe",
         );
-        f.graphics_modules = None;
+        f.modules = None;
         assert_eq!(classify(&f, &cfg), Verdict::Detected);
         assert_eq!(display_name(&f, &cfg), "Fortnite");
         f.is_foreground = false;

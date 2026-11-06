@@ -14,14 +14,50 @@ pub fn autostart_command(exe: &std::path::Path) -> String {
 }
 
 #[cfg(windows)]
-mod reg {
+pub(crate) mod reg {
     use crate::wstr::{from_wide, wide};
-    use windows::core::PCWSTR;
+    use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
     use windows::Win32::System::Registry::{
-        RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY, HKEY_CURRENT_USER, REG_DWORD,
-        REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+        RegCloseKey, RegDeleteKeyValueW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW,
+        RegSetKeyValueW, HKEY, HKEY_CURRENT_USER, KEY_READ, REG_DWORD, REG_SZ, RRF_RT_REG_DWORD,
+        RRF_RT_REG_SZ,
     };
+
+    /// Names of the direct subkeys of `root\key` (empty if it can't be opened).
+    pub fn subkeys(root: HKEY, key: &str) -> Vec<String> {
+        let k = wide(key);
+        let mut h = HKEY::default();
+        let mut out = Vec::new();
+        unsafe {
+            if RegOpenKeyExW(root, PCWSTR(k.as_ptr()), None, KEY_READ, &mut h) != ERROR_SUCCESS {
+                return out;
+            }
+            let mut i = 0u32;
+            loop {
+                // Key names are limited to 255 characters.
+                let mut name = [0u16; 256];
+                let mut len = name.len() as u32;
+                let rc = RegEnumKeyExW(
+                    h,
+                    i,
+                    Some(PWSTR(name.as_mut_ptr())),
+                    &mut len,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                if rc != ERROR_SUCCESS {
+                    break;
+                }
+                out.push(String::from_utf16_lossy(&name[..len as usize]));
+                i += 1;
+            }
+            let _ = RegCloseKey(h);
+        }
+        out
+    }
 
     pub fn get_dword(root: HKEY, key: &str, name: &str) -> Option<u32> {
         let (k, n) = (wide(key), wide(name));
@@ -189,6 +225,34 @@ pub fn windows_build() -> Option<u32> {
     #[cfg(not(windows))]
     {
         None
+    }
+}
+
+/// Executables Windows itself has recognised as games, lower-cased full
+/// paths. Game Bar matches launched programs against Microsoft's catalogue
+/// of known games (and games the user ticked "Remember this is a game" for)
+/// and records them under `HKCU\System\GameConfigStore\Children`.
+pub fn windows_known_games() -> std::collections::HashSet<String> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Registry::HKEY_CURRENT_USER;
+        const KEY: &str = r"System\GameConfigStore\Children";
+        reg::subkeys(HKEY_CURRENT_USER, KEY)
+            .into_iter()
+            .filter_map(|id| {
+                reg::get_string(
+                    HKEY_CURRENT_USER,
+                    &format!(r"{KEY}\{id}"),
+                    "MatchedExeFullPath",
+                )
+            })
+            .map(|p| p.trim().to_lowercase())
+            .filter(|p| !p.is_empty())
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        std::collections::HashSet::new()
     }
 }
 

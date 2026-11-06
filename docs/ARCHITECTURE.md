@@ -115,9 +115,15 @@ Chapters written by other tools are imported as bookmarks.
 
 - **Game detection** (`gc-platform::watcher` + `gc-core::detect`): only the
   foreground process and user-registered executables are inspected in depth.
-  Signals: graphics DLLs from a module snapshot, fullscreen/borderless
-  foreground window, launcher install paths, Store package. Processes whose
-  module list cannot be read (anti-cheat protected) rely on the other signals.
+  Rendering fullscreen is never enough on its own (video players, browsers
+  and editors do that too); a game needs positive evidence. Strong: Windows
+  Game Bar lists the exe as a game (`HKCU\System\GameConfigStore\Children`)
+  or it is installed in a launcher library (`steamapps\common`, Epic, Xbox…).
+  Weak, only counted with a fullscreen/borderless foreground window: game
+  engine/SDK/anti-cheat DLLs (`UnityPlayer.dll`, `steam_api64.dll`…), an
+  Unreal `-Shipping` exe, a `Games` folder, or a Store package whose modules
+  can't be read. A readable module list must also include a graphics API.
+  Known non-games (players, editors, the Steam build of Godot…) are excluded.
 - **Hotkeys**: one `WH_KEYBOARD_LL` hook on a dedicated message-loop thread;
   the hook only matches and forwards, never blocks, and does not swallow keys.
 - **Registry**: Game Mode (`AllowAutoGameMode` and `AutoGameModeEnabled`)
