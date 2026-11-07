@@ -1,5 +1,8 @@
 use crate::ffmpeg::{choose_backends, codec_label, probe_encoders, EncoderInfo, Ffmpeg};
-use crate::pipeline::{window_sends_frames, AudioPlan, Pipeline, RingPlan, RingSource, Shared};
+use crate::pipeline::{
+    window_has_drawn, window_sends_frames, AudioPlan, FocusTarget, Pipeline, RingPlan, RingSource,
+    Shared,
+};
 use crate::screenshot::{self, ShotTarget};
 use crate::session::SessionWriter;
 use chrono::{DateTime, Duration as ChronoDuration, Local};
@@ -15,6 +18,7 @@ use gc_core::ring::{RingStats, Store};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -261,6 +265,11 @@ impl CaptureEngine {
             window_probe_backoff: Duration::from_secs(2),
             failed_window_probes: 0,
             standby_stills: Vec::new(),
+            game_drawn: Arc::new(AtomicBool::new(true)),
+            drawn_window: None,
+            drawn_probe: None,
+            next_drawn_probe: None,
+            undrawn_since: Instant::now(),
         };
         let thread = std::thread::Builder::new()
             .name("gc-capture-engine".into())
@@ -485,6 +494,18 @@ struct Worker {
     failed_window_probes: u32,
     /// Held-frame images written for standby pipelines.
     standby_stills: Vec<std::path::PathBuf>,
+    /// The game window has drawn (see [`FocusTarget::drawn`]); shared with
+    /// every pipeline's focus screen.
+    game_drawn: Arc<AtomicBool>,
+    /// The game window, client size and monitor rectangle `game_drawn` is
+    /// about.
+    drawn_window: Option<GameWindow>,
+    /// Running check whether that window has drawn: (window, result).
+    drawn_probe: Option<(isize, DrawnResult)>,
+    /// Earliest next check.
+    next_drawn_probe: Option<Instant>,
+    /// When `game_drawn` last went false.
+    undrawn_since: Instant,
 }
 
 /// Where [`Worker::switch_slot`] moves a pipeline.
@@ -504,6 +525,13 @@ const MAX_FAILED_WINDOW_PROBES: u32 = 8;
 /// A game's main window: handle, client size and, when capture follows the
 /// window's position on the monitor (Desktop Duplication), its rectangle.
 type GameWindow = (isize, (u32, u32), Option<(i32, i32, u32, u32)>);
+
+/// Result slot of a running drawn check (see [`window_has_drawn`]).
+type DrawnResult = Arc<Mutex<Option<Option<bool>>>>;
+
+/// How long the game may count as not drawn before the capture is shown
+/// anyway, so a check that never passes can't hide the game for good.
+const DRAWN_GIVE_UP: Duration = Duration::from_secs(60);
 
 /// Consecutive 1 s ticks a new game window must persist before capture
 /// switches to it (rides out loading screens and mode switches).
@@ -788,6 +816,7 @@ impl Worker {
                 *m = None;
             }
         }
+        self.track_game_drawn();
         self.manage_standby();
         // Recorder health: a dead recorder ends the recording.
         let recorder_dead = {
@@ -908,7 +937,7 @@ impl Worker {
         ff: &Ffmpeg,
         p: Pipeline,
         audio: &AudioPlan,
-        game_pid: Option<u32>,
+        game_pid: Option<FocusTarget>,
     ) -> Option<Pipeline> {
         let spec = p.spec.clone();
         let shared = p.handover(Duration::ZERO);
@@ -1016,7 +1045,7 @@ impl Worker {
         };
         let mut shared = old.handover(grace);
         let audio = self.audio_plan();
-        let game_pid = self.game.as_ref().map(|g| g.pid);
+        let game_pid = self.focus_target();
         // (spec, window capture to resume later)
         let still = self.last_frame(&shared);
         let attempts = match to {
@@ -1028,7 +1057,7 @@ impl Worker {
         };
         for (spec, resume) in attempts {
             let source = RingSource::Takeover(shared.clone());
-            match Pipeline::start_on(&ff, spec, &audio, source, game_pid) {
+            match Pipeline::start_on(&ff, spec, &audio, source, game_pid.clone()) {
                 Ok(mut p) => match p.wait_healthy(Duration::from_secs(8)) {
                     Ok(()) => {
                         p.resume = resume;
@@ -1133,19 +1162,111 @@ impl Worker {
         }
     }
 
+    /// The game the focus screen follows, if any.
+    fn focus_target(&self) -> Option<FocusTarget> {
+        self.game.as_ref().map(|g| FocusTarget {
+            pid: g.pid,
+            drawn: self.game_drawn.clone(),
+        })
+    }
+
+    /// Keeps `game_drawn` current: whether the screen shows the game while
+    /// it is in front. A game window is see-through until it draws its first
+    /// frame (CoD shows the Steam library through its window for the first
+    /// ~40 s), and right after CoD's window goes fullscreen monitor capture
+    /// can keep showing the Steam library behind it until the next alt-tab.
+    /// So each new, moved or resized game window, and each capture start,
+    /// counts as not drawn until a check (every 2 s while the game is in
+    /// front, see [`window_has_drawn`]) finds the screen showing the game,
+    /// or [`DRAWN_GIVE_UP`] passes.
+    fn track_game_drawn(&mut self) {
+        let Some(window) = self.current_game_window(true) else {
+            if self.game.is_none() {
+                self.drawn_window = None;
+                self.drawn_probe = None;
+                self.game_drawn.store(true, Ordering::Relaxed);
+            }
+            return; // minimised or not open yet: keep what we know
+        };
+        let hwnd = window.0;
+        if self.drawn_window != Some(window) {
+            self.drawn_window = Some(window);
+            self.drawn_probe = None;
+            self.next_drawn_probe = None;
+            self.undrawn_since = Instant::now();
+            let can_check = self
+                .probe
+                .read()
+                .as_ref()
+                .is_some_and(|(caps, _)| caps.has_filter("gfxcapture"));
+            self.game_drawn.store(!can_check, Ordering::Relaxed);
+            if can_check {
+                log::info!("checking that the screen shows the game before showing it");
+            }
+        }
+        if self.game_drawn.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.undrawn_since.elapsed() > DRAWN_GIVE_UP {
+            log::warn!(
+                "the screen still doesn't seem to show the game after {} s; showing the capture anyway",
+                DRAWN_GIVE_UP.as_secs()
+            );
+            self.drawn_probe = None;
+            self.game_drawn.store(true, Ordering::Relaxed);
+            return;
+        }
+        if let Some((probed, result)) = &self.drawn_probe {
+            let Some(drawn) = *result.lock() else {
+                return; // still checking
+            };
+            let probed = *probed;
+            self.drawn_probe = None;
+            if probed == hwnd && drawn == Some(true) {
+                log::info!("the screen shows the game; showing the capture");
+                self.game_drawn.store(true, Ordering::Relaxed);
+                return;
+            }
+            self.next_drawn_probe = Some(Instant::now() + Duration::from_secs(2));
+        }
+        if self.next_drawn_probe.is_some_and(|t| Instant::now() < t) {
+            return;
+        }
+        // Only while the game is in front: the focus screen covers the rest,
+        // and each check flashes the capture border on Windows 10.
+        let pid = self.game.as_ref().map(|g| g.pid);
+        if !gc_platform::process::foreground_window().is_some_and(|f| Some(f.pid) == pid) {
+            return;
+        }
+        // Compare with the screen only when the window covers its monitor:
+        // a windowed game's frame and title bar would never match.
+        let screen = gc_platform::display::window_placement(hwnd)
+            .filter(|pl| pl.fullscreen && pl.monitor.adapter_idx == 0)
+            .map(|pl| (pl.monitor.output_idx, pl.rect));
+        let Some(ff) = self.ff.clone() else { return };
+        let result = Arc::new(Mutex::new(None));
+        let out = result.clone();
+        let spawned = std::thread::Builder::new()
+            .name("gc-drawn-probe".into())
+            .spawn(move || *out.lock() = Some(window_has_drawn(&ff, hwnd as u64, screen)));
+        if spawned.is_ok() {
+            self.drawn_probe = Some((hwnd, result));
+        }
+    }
+
     /// The game's current main window and its client size, plus its
     /// rectangle on the monitor when `with_rect`.
     #[cfg(windows)]
     fn current_game_window(&self, with_rect: bool) -> Option<GameWindow> {
-        use gc_platform::display::{window_client_size, window_placement};
+        use gc_platform::display::{window_client_size, window_monitor_rect};
         let g = self.game.as_ref()?;
         let h = g
             .hwnd
             .or_else(|| gc_platform::process::main_window(g.pid))?;
         let size = window_client_size(h)?;
-        let rect = with_rect
-            .then(|| window_placement(h).map(|p| p.rect))
-            .flatten();
+        // Polled every second during capture: no DXGI here (see
+        // `window_monitor_rect`).
+        let rect = with_rect.then(|| window_monitor_rect(h)).flatten();
         Some((h, size, rect))
     }
     #[cfg(not(windows))]
@@ -1343,7 +1464,12 @@ impl Worker {
 
         let mut errors = Vec::new();
         let order = choose_backends(s.video.encoder, s.video.codec, &probed);
-        let game_pid = self.game.as_ref().map(|g| g.pid);
+        // Re-check on every capture start: after CoD's window went
+        // fullscreen, the restarted monitor capture showed Steam behind it.
+        self.drawn_window = None;
+        self.track_game_drawn();
+        let game_pid = self.focus_target();
+        let starts_shown = !self.game_drawn.load(Ordering::Relaxed);
         for &(backend, codec) in &order {
             let zc_variants: &[bool] = if s.video.zero_copy && backend.is_hardware() {
                 &[true, false]
@@ -1377,6 +1503,7 @@ impl Worker {
                             has_scale_d3d11: caps.has_filter("scale_d3d11"),
                             focus_screen: focus.then(|| FocusScreen {
                                 font_file: font.clone(),
+                                shown: starts_shown,
                             }),
                             audio: Vec::new(),
                             mixdown: s.audio.mixdown_enabled,
@@ -1388,20 +1515,22 @@ impl Worker {
                             continue; // identical to the download variant
                         }
                         let window_target = matches!(target.video, VideoSource::Window { .. });
-                        let started = Pipeline::start(&ff, spec, &audio, ring.clone(), game_pid)
-                            .and_then(|mut p| match p.wait_healthy(Duration::from_secs(8)) {
-                                Ok(()) => Ok(p),
-                                // Captures fine but the window sends no frames
-                                // yet (loading): show the focus screen until
-                                // it does.
-                                Err(e) if window_target && p.is_running() => {
-                                    log::info!(
-                                        "game window sends no frames yet; starting on standby"
-                                    );
-                                    self.standby_takeover(&ff, p, &audio, game_pid).ok_or(e)
-                                }
-                                Err(e) => Err(e),
-                            });
+                        let started =
+                            Pipeline::start(&ff, spec, &audio, ring.clone(), game_pid.clone())
+                                .and_then(|mut p| match p.wait_healthy(Duration::from_secs(8)) {
+                                    Ok(()) => Ok(p),
+                                    // Captures fine but the window sends no frames
+                                    // yet (loading): show the focus screen until
+                                    // it does.
+                                    Err(e) if window_target && p.is_running() => {
+                                        log::info!(
+                                            "game window sends no frames yet; starting on standby"
+                                        );
+                                        self.standby_takeover(&ff, p, &audio, game_pid.clone())
+                                            .ok_or(e)
+                                    }
+                                    Err(e) => Err(e),
+                                });
                         let name = encoder_name(backend, codec);
                         match started {
                             Ok(p) => {

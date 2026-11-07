@@ -81,7 +81,10 @@ fn focus_screen_switches_live() {
         zero_copy: false,
         gpu_scaler: None,
         has_scale_d3d11: false,
-        focus_screen: Some(FocusScreen { font_file: font }),
+        focus_screen: Some(FocusScreen {
+            font_file: font,
+            shown: false,
+        }),
         audio: vec![],
         mixdown: false,
         audio_bitrate_kbps: 128,

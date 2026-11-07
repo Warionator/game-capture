@@ -65,6 +65,11 @@ pub fn window_placement(_hwnd: isize) -> Option<WindowPlacement> {
 }
 
 #[cfg(not(windows))]
+pub fn window_monitor_rect(_hwnd: isize) -> Option<(i32, i32, u32, u32)> {
+    None
+}
+
+#[cfg(not(windows))]
 pub fn window_client_size(_hwnd: isize) -> Option<(u32, u32)> {
     None
 }
@@ -75,7 +80,9 @@ mod imp {
     use crate::wstr::from_wide;
     use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
-    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect};
 
     /// Size of a window's client area (what Windows Graphics Capture
@@ -125,6 +132,40 @@ mod imp {
             }
         }
         out
+    }
+
+    /// The window's rectangle relative to its monitor, as in
+    /// [`window_placement`], from user32 alone. Cheap enough to poll while
+    /// capturing: creating a DXGI factory and enumerating outputs (as
+    /// `list_monitors` does) stalls Desktop Duplication for 100-250 ms on
+    /// some drivers, which shows up as a hitch in the recording.
+    pub fn window_monitor_rect(hwnd: isize) -> Option<(i32, i32, u32, u32)> {
+        unsafe {
+            let hwnd = HWND(hwnd as *mut _);
+            let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            GetMonitorInfoW(mon, &mut mi).ok().ok()?;
+            let m = mi.rcMonitor;
+            let monitor = MonitorInfo {
+                adapter_idx: 0,
+                output_idx: 0,
+                global_idx: 0,
+                device_name: String::new(),
+                adapter_name: String::new(),
+                x: m.left,
+                y: m.top,
+                width: (m.right - m.left) as u32,
+                height: (m.bottom - m.top) as u32,
+                primary: false,
+                hmonitor: mon.0 as isize,
+            };
+            let mut r = RECT::default();
+            GetWindowRect(hwnd, &mut r).ok()?;
+            clamp_to_monitor((r.left, r.top, r.right, r.bottom), &monitor)
+        }
     }
 
     pub fn window_placement(hwnd: isize) -> Option<WindowPlacement> {

@@ -239,6 +239,8 @@ pub enum Output {
 pub struct FocusScreen {
     /// TTF for the caption (`drawtext`); `None` = no caption, plain screen.
     pub font_file: Option<String>,
+    /// Start with the screen showing (the game window hasn't drawn yet).
+    pub shown: bool,
 }
 
 /// Background colour of the focus screen (matches the app UI).
@@ -247,6 +249,9 @@ pub const FOCUS_SCREEN_COLOR: &str = "0x0b0d12";
 /// Bytes to write to FFmpeg's stdin to show (`true`) or hide the focus
 /// screen. Uses FFmpeg's interactive `c` command, which sends `map` to the
 /// `streamselect` filter in the running graph.
+/// The focus screen's keepalive input (see `PipelineSpec::build_args`).
+pub const FOCUS_KEEPALIVE: &str = "anullsrc=r=8000:cl=mono:nb_samples=16,arealtime";
+
 pub fn focus_command(show_screen: bool) -> String {
     format!("cstreamselect -1 map {}\n", u8::from(show_screen))
 }
@@ -373,14 +378,37 @@ impl PipelineSpec {
         chain.join(",")
     }
 
-    /// The focus-screen source, sized like the capture.
+    /// The focus-screen source, sized like the capture: drawn (and
+    /// uploaded) once, then the same frame repeated at the capture frame
+    /// rate. Drawing and uploading a new frame every second made a GPU-bound
+    /// game's capture freeze for 100-250 ms each second, as the upload waits
+    /// for the GPU on the device the capture uses. Repeating it only once a
+    /// second made a graph that starts on the focus screen (game not drawn
+    /// yet) put out one frame a second for good, even after switching back
+    /// to the capture.
     fn focus_source(&self, f: &FocusScreen, upload: bool) -> String {
-        self.screen_source(&f.font_file, 1, upload)
+        format!(
+            "{},loop=loop=-1:size=1",
+            self.screen_source(&f.font_file, true, upload)
+        )
     }
 
-    /// The focus-screen picture at `rate` frames per second.
-    fn screen_source(&self, font_file: &Option<String>, rate: u32, upload: bool) -> String {
+    /// The focus-screen picture at one frame per second, or (`once`) a
+    /// single frame timed for the capture frame rate.
+    fn screen_source(&self, font_file: &Option<String>, once: bool, upload: bool) -> String {
         let (w, h) = self.source_size;
+        let rate = if once {
+            // Uncapped capture has no fps filter after the switch: repeat
+            // the focus screen at 60.
+            let fps = if self.fps.is_uncapped() {
+                60
+            } else {
+                self.fps.0
+            };
+            format!("{fps}:d=1")
+        } else {
+            "1".into()
+        };
         let mut src = format!("color=c={FOCUS_SCREEN_COLOR}:s={w}x{h}:r={rate}");
         if let Some(font) = font_file {
             let font = filter_quote(font);
@@ -425,13 +453,15 @@ impl PipelineSpec {
                     .map(|t| format!(",{t}"))
                     .unwrap_or_default();
                 format!(
-                    "{src}[cap];{}[fs];[cap][fs]streamselect=inputs=2:map=0{fps}{tail}[v]",
+                    "{src}[cap];{}[fs];[cap][fs]streamselect=inputs=2:map={}{fps}{tail}[v]",
                     self.focus_source(f, true),
+                    u8::from(f.shown),
                 )
             }
             Some(f) => format!(
-                "{src}{download}[cap];{}[fs];[cap][fs]streamselect=inputs=2:map=0{fps},{}[v]",
+                "{src}{download}[cap];{}[fs];[cap][fs]streamselect=inputs=2:map={}{fps},{}[v]",
                 self.focus_source(f, false),
+                u8::from(f.shown),
                 self.cpu_tail()
             ),
         }
@@ -446,6 +476,12 @@ impl PipelineSpec {
             &mut a,
             &["-hide_banner", "-loglevel", "warning", "-nostats"],
         );
+        // FFmpeg reads stdin commands (the focus-screen switch) only when its
+        // main loop wakes, once per stats period: 500 ms by default, which
+        // let up to half a second of an alt-tabbed window into the capture.
+        if self.focus_screen.is_some() {
+            push(&mut a, &["-stats_period", "0.01"]);
+        }
 
         // A shared D3D11 device: needed to pick an adapter, and so the focus
         // screen is uploaded to the same device the capture uses.
@@ -517,7 +553,7 @@ impl PipelineSpec {
                         "movie={}:loop=0,setpts=N/TB,scale={w}:{h},format=bgra",
                         filter_quote(img)
                     ),
-                    None => self.screen_source(font_file, 1, false),
+                    None => self.screen_source(font_file, false, false),
                 };
                 format!("{picture},fps={fps},realtime")
             }
@@ -552,19 +588,24 @@ impl PipelineSpec {
         // source, so without audio filters the switch was silently ignored.
         // A silent, real-time-paced input that only feeds `anullsink` gives
         // the graph a live input. It is never mapped to the output.
+        // FFmpeg runs a graph on one thread, and while it waits for the next
+        // frame of an input it doesn't pull frames from ddagrab, which then
+        // misses them: keep its frames tiny (16 samples, 2 ms). The default
+        // 1024 samples (128 ms) cut a 60 fps capture to a few distinct
+        // frames a second.
         let keepalive = self.focus_screen.is_some().then_some(self.audio.len());
         if keepalive.is_some() {
-            push(
-                &mut a,
-                &["-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono,arealtime"],
-            );
+            push(&mut a, &["-f", "lavfi", "-i", FOCUS_KEEPALIVE]);
         }
 
-        // --- filter graph --------------------------------------------------
-        let mut graph: Vec<String> = vec![self.video_graph(&video_src)];
+        // --- filter graphs -------------------------------------------------
+        // Video and audio are separate graphs (separate FFmpeg threads), so
+        // audio that arrives in bursts never holds up the capture.
+        let mut video_graph: Vec<String> = vec![self.video_graph(&video_src)];
         if let Some(idx) = keepalive {
-            graph.push(format!("[{idx}:a]anullsink"));
+            video_graph.push(format!("[{idx}:a]anullsink"));
         }
+        let mut graph: Vec<String> = Vec::new();
         let video_map = "[v]".to_string();
 
         let mix_members: Vec<usize> = (0..self.audio.len())
@@ -603,7 +644,10 @@ impl PipelineSpec {
             graph.push(mix);
             track_maps.insert(0, "[mix]".into());
         }
-        push(&mut a, &["-filter_complex", &graph.join(";")]);
+        push(&mut a, &["-filter_complex", &video_graph.join(";")]);
+        if !graph.is_empty() {
+            push(&mut a, &["-filter_complex", &graph.join(";")]);
+        }
 
         push(&mut a, &["-map", &video_map]);
         for m in &track_maps {
@@ -1270,6 +1314,15 @@ mod tests {
             .map(|i| args[i + 1].as_str())
     }
 
+    /// The second `-filter_complex`: the audio graph.
+    fn audio_graph(args: &[String]) -> &str {
+        args.windows(2)
+            .filter(|w| w[0] == "-filter_complex")
+            .nth(1)
+            .map(|w| w[1].as_str())
+            .expect("an audio graph")
+    }
+
     #[test]
     fn nvenc_native_is_zero_copy_passthrough() {
         let s = spec();
@@ -1278,10 +1331,11 @@ mod tests {
         assert_eq!(arg_after(&a, "-i"), Some(r"\\.\pipe\gc-1-0"));
         assert!(!a.iter().any(|x| x == "-init_hw_device"));
         let fc = arg_after(&a, "-filter_complex").unwrap();
-        assert!(
-            fc.starts_with("ddagrab=output_idx=0:framerate=60:draw_mouse=0[v];"),
-            "no video filter expected: {fc}"
+        assert_eq!(
+            fc, "ddagrab=output_idx=0:framerate=60:draw_mouse=0[v]",
+            "no video filter expected, audio in its own graph"
         );
+        let fc = audio_graph(&a);
         assert!(fc.contains("[1:a]afftdn=nr=12:nf=-40[dn1]"));
         assert!(fc.contains("[mx0][mx1]amix=inputs=2"));
         let maps: Vec<_> = a
@@ -1352,10 +1406,8 @@ mod tests {
     fn single_mix_member_uses_anull() {
         let mut s = spec();
         s.audio.truncate(1);
-        let fc = arg_after(&s.build_args(), "-filter_complex")
-            .unwrap()
-            .to_string();
-        assert!(fc.contains("[mx0]anull[mix]"));
+        let a = s.build_args();
+        assert!(audio_graph(&a).contains("[mx0]anull[mix]"));
     }
 
     #[test]
@@ -1386,6 +1438,7 @@ mod tests {
         s.source_size = (1920, 1080);
         s.focus_screen = Some(FocusScreen {
             font_file: Some(r"C:\Windows\Fonts\segoeui.ttf".into()),
+            shown: false,
         });
         // NVENC encodes both frame sources directly when not scaling: no
         // scale_d3d11 needed (it fails to allocate on some FFmpeg 8 builds).
@@ -1397,13 +1450,30 @@ mod tests {
             "gfxcapture=hwnd=4660:max_framerate=60:capture_cursor=0:width=1920:height=1080:resize_mode=scale_aspect,fps=60[cap];"
         ), "{fc}");
         assert!(!fc.contains("dup_frames"), "{fc}");
-        assert!(fc.contains("color=c=0x0b0d12:s=1920x1080:r=1,drawtext=fontfile='C\\:/Windows/Fonts/segoeui.ttf'"), "{fc}");
-        assert!(fc.contains(",format=bgra,hwupload[fs];"), "{fc}");
+        assert!(fc.contains("color=c=0x0b0d12:s=1920x1080:r=60:d=1,drawtext=fontfile='C\\:/Windows/Fonts/segoeui.ttf'"), "{fc}");
+        assert!(
+            fc.contains(",format=bgra,hwupload,loop=loop=-1:size=1[fs];"),
+            "{fc}"
+        );
         assert!(
             fc.contains("[cap][fs]streamselect=inputs=2:map=0,fps=60[v]"),
             "{fc}"
         );
         assert_eq!(focus_command(true), "cstreamselect -1 map 1\n");
+
+        // Commands are read every 10 ms, not every 500 ms.
+        assert_eq!(arg_after(&a, "-stats_period"), Some("0.01"));
+
+        // A game window that hasn't drawn yet starts on the focus screen.
+        let mut shown = s.clone();
+        shown.focus_screen.as_mut().unwrap().shown = true;
+        let fc = arg_after(&shown.build_args(), "-filter_complex")
+            .unwrap()
+            .to_string();
+        assert!(
+            fc.contains("[cap][fs]streamselect=inputs=2:map=1,fps=60[v]"),
+            "{fc}"
+        );
 
         // Other encoders (and scaling) re-render into one pool first.
         s.backend = Backend::Amf;
@@ -1423,7 +1493,10 @@ mod tests {
             font_file: None,
         };
         s.source_size = (1920, 1080);
-        s.focus_screen = Some(FocusScreen { font_file: None });
+        s.focus_screen = Some(FocusScreen {
+            font_file: None,
+            shown: false,
+        });
         assert!(!s.is_zero_copy());
         let a = s.build_args();
         assert_eq!(arg_after(&a, "-init_hw_device"), None);
@@ -1476,19 +1549,25 @@ mod tests {
         let mut s = spec();
         s.backend = Backend::Software;
         s.resolution = Resolution::P1080;
-        s.focus_screen = Some(FocusScreen { font_file: None });
+        s.focus_screen = Some(FocusScreen {
+            font_file: None,
+            shown: false,
+        });
         let a = s.build_args();
         assert!(!a.iter().any(|x| x == "-init_hw_device"));
         let fc = arg_after(&a, "-filter_complex").unwrap();
         assert!(fc.starts_with(
-            "ddagrab=output_idx=0:framerate=60:draw_mouse=0,hwdownload,format=bgra[cap];color=c=0x0b0d12:s=2560x1440:r=1,format=bgra[fs];[cap][fs]streamselect=inputs=2:map=0,fps=60,scale=1920:1080:flags=bicubic,format=yuv420p[v]"
+            "ddagrab=output_idx=0:framerate=60:draw_mouse=0,hwdownload,format=bgra[cap];color=c=0x0b0d12:s=2560x1440:r=60:d=1,format=bgra,loop=loop=-1:size=1[fs];[cap][fs]streamselect=inputs=2:map=0,fps=60,scale=1920:1080:flags=bicubic,format=yuv420p[v]"
         ), "{fc}");
     }
 
     #[test]
     fn focus_screen_adds_keepalive_input_after_audio() {
         let mut s = spec();
-        s.focus_screen = Some(FocusScreen { font_file: None });
+        s.focus_screen = Some(FocusScreen {
+            font_file: None,
+            shown: false,
+        });
         let a = s.build_args();
         let inputs: Vec<&str> = a
             .windows(2)
@@ -1498,7 +1577,8 @@ mod tests {
         let n = s.audio.len();
         // Audio keeps indices 0..n; the keepalive is input n and unmapped.
         assert_eq!(inputs.len(), n + 1, "{inputs:?}");
-        assert_eq!(inputs[n], "anullsrc=r=8000:cl=mono,arealtime");
+        assert_eq!(inputs[n], "anullsrc=r=8000:cl=mono:nb_samples=16,arealtime");
+        // In the video graph, so that graph has an input to take commands.
         let fc = arg_after(&a, "-filter_complex").unwrap();
         assert!(fc.contains(&format!(";[{n}:a]anullsink")), "{fc}");
         assert!(!a.iter().any(|x| x == &format!("{n}:a")), "{a:?}");

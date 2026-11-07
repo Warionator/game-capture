@@ -33,6 +33,18 @@ pub struct RingPlan {
     pub max_bytes: u64,
 }
 
+/// The game a pipeline's focus screen follows.
+#[derive(Clone)]
+pub struct FocusTarget {
+    /// The game process: while another process owns the foreground window
+    /// the recording shows the focus screen instead.
+    pub pid: u32,
+    /// The game window has drawn something. Until then it is see-through
+    /// (a game window before its first frame), and monitor capture would
+    /// record whatever is behind it, so the focus screen stays on.
+    pub drawn: Arc<AtomicBool>,
+}
+
 pub struct Shared {
     pub ring: Mutex<ReplayRing>,
     pub chunker: Mutex<TsChunker>,
@@ -110,16 +122,15 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// Starts FFmpeg and the audio engine. With a focus screen in `spec`,
-    /// `focus_pid` is the game process: while another process owns the
-    /// foreground window the recording shows the focus screen instead.
+    /// `focus` is the game the focus screen follows.
     pub fn start(
         ff: &Ffmpeg,
         spec: PipelineSpec,
         audio: &AudioPlan,
         ring: RingPlan,
-        focus_pid: Option<u32>,
+        focus: Option<FocusTarget>,
     ) -> anyhow::Result<Self> {
-        Self::start_on(ff, spec, audio, RingSource::New(ring), focus_pid)
+        Self::start_on(ff, spec, audio, RingSource::New(ring), focus)
     }
 
     /// Starts a pipeline on `ring`: a new one, or one handed over by
@@ -129,7 +140,7 @@ impl Pipeline {
         mut spec: PipelineSpec,
         audio: &AudioPlan,
         ring: RingSource,
-        focus_pid: Option<u32>,
+        focus_target: Option<FocusTarget>,
     ) -> anyhow::Result<Self> {
         // Set up the ring first: a takeover continues the old timeline.
         let shared = match ring {
@@ -164,7 +175,11 @@ impl Pipeline {
             spec.video,
             gc_core::ffmpeg::VideoSource::Standby { still: None, .. }
         );
-        shared.focus_lost.store(focus_picture, Ordering::Relaxed);
+        // A pipeline for a game window that hasn't drawn yet starts on it.
+        let starts_shown = spec.focus_screen.as_ref().is_some_and(|f| f.shown);
+        shared
+            .focus_lost
+            .store(focus_picture || starts_shown, Ordering::Relaxed);
 
         let inputs: Vec<&TrackSpec> = audio
             .layout
@@ -279,13 +294,13 @@ impl Pipeline {
                 .spawn(move || read_loop(stdout, &shared))?
         };
 
-        let focus = match (spec.focus_screen.is_some(), focus_pid) {
-            (true, Some(pid)) => {
+        let focus = match (spec.focus_screen.is_some(), focus_target) {
+            (true, Some(target)) => {
                 let stop = Arc::new(AtomicBool::new(false));
                 let (stop2, shared2, stdin2) = (stop.clone(), shared.clone(), stdin.clone());
                 let t = std::thread::Builder::new()
                     .name("gc-focus".into())
-                    .spawn(move || focus_loop(pid, &stop2, &shared2, &stdin2))?;
+                    .spawn(move || focus_loop(&target, starts_shown, &stop2, &shared2, &stdin2))?;
                 Some((stop, t))
             }
             _ => None,
@@ -442,34 +457,48 @@ fn read_loop(mut stdout: impl Read, shared: &Shared) {
     shared.exited.store(true, Ordering::SeqCst);
 }
 
+/// How often the focus loop checks the foreground window. Each check is a
+/// few cheap user32 calls.
+const FOCUS_POLL: Duration = Duration::from_millis(10);
+/// How long the game must stay in front before the focus screen goes off.
+const FOCUS_RETURN: Duration = Duration::from_millis(100);
+
 /// Polls the foreground window and switches the focus screen on/off.
-/// A change must persist for two polls (~400 ms) so brief popups and
-/// alt-tab flicker don't toggle the picture.
+/// Losing focus shows the screen at once: anything else on screen (Start
+/// menu, taskbar, another app) must not reach the recording. Returning
+/// must persist for [`FOCUS_RETURN`] so alt-tab flicker doesn't flash the
+/// desktop back in.
 fn focus_loop(
-    game_pid: u32,
+    target: &FocusTarget,
+    starts_shown: bool,
     stop: &AtomicBool,
     shared: &Shared,
     stdin: &Mutex<Option<ChildStdin>>,
 ) {
-    let mut shown = false;
-    let mut candidate_since: Option<bool> = None;
+    let mut shown = starts_shown;
+    // Since when the game has been back in front (focus screen showing).
+    let mut back_since: Option<Instant> = None;
     while !stop.load(Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(FOCUS_POLL);
         // A minimised game can stay the foreground window when nothing else
         // takes over; it is out of focus all the same (no client area).
-        let in_focus = gc_platform::process::foreground_window().is_some_and(|f| {
-            f.pid == game_pid && gc_platform::display::window_client_size(f.hwnd).is_some()
-        });
+        // Alt+Tab and the like count as out of focus from the key press:
+        // FFmpeg takes ~50-80 ms to switch, too long to wait for Windows to
+        // change the foreground window (the new window would show first).
+        let in_focus = target.drawn.load(Ordering::Relaxed)
+            && !gc_platform::hotkeys::switching_away()
+            && gc_platform::process::foreground_window().is_some_and(|f| {
+                f.pid == target.pid && gc_platform::display::window_client_size(f.hwnd).is_some()
+            });
         let want = !in_focus;
         if want == shown {
-            candidate_since = None;
+            back_since = None;
             continue;
         }
-        if candidate_since != Some(want) {
-            candidate_since = Some(want);
+        if !want && back_since.get_or_insert_with(Instant::now).elapsed() < FOCUS_RETURN {
             continue;
         }
-        candidate_since = None;
+        back_since = None;
         let mut guard = stdin.lock();
         let Some(pipe) = guard.as_mut() else { return };
         if pipe
@@ -483,6 +512,165 @@ fn focus_loop(
         shared.focus_lost.store(want, Ordering::Relaxed);
         log::debug!("focus screen {}", if want { "on" } else { "off" });
     }
+}
+
+/// Side of the shrunk frames the drawn check compares.
+const DRAWN_SIDE: usize = 32;
+/// Average per-channel difference (0-255) between the game window and the
+/// screen above which the screen is not showing the game.
+const SCREEN_MISMATCH: usize = 24;
+
+/// Whether the window `hwnd` is what the screen shows. One frame of the
+/// window through Windows Graphics Capture, shrunk to 32x32, must be mostly
+/// opaque (a window before its first frame can come back transparent), and,
+/// when `screen` gives the monitor (output index) and the window's rectangle
+/// on it, the same area grabbed with Desktop Duplication must look like it:
+/// CoD's fullscreen window comes back solid black from Windows Graphics
+/// Capture while monitor capture shows the Steam library behind it.
+/// `None` when no window frame arrived within ~3 s (minimised); can't check
+/// (FFmpeg error) counts as drawn so the capture is never held back.
+pub fn window_has_drawn(
+    ff: &Ffmpeg,
+    hwnd: u64,
+    screen: Option<(u32, (i32, i32, u32, u32))>,
+) -> Option<bool> {
+    let shrink =
+        format!("hwdownload,format=bgra,scale={DRAWN_SIDE}:{DRAWN_SIDE}:flags=area,format=bgra");
+    let window = match grab_frame(
+        ff,
+        &format!("gfxcapture=hwnd={hwnd}:max_framerate=30:capture_cursor=0,{shrink}"),
+    ) {
+        Grab::Frame(f) => f,
+        Grab::TimedOut => return None,
+        Grab::Failed => {
+            log::debug!("drawn check: no frame from the game window; assuming drawn");
+            return Some(true);
+        }
+    };
+    let avg = |f: &[u8], i: usize| {
+        f.chunks_exact(4).map(|p| p[i] as usize).sum::<usize>() / (DRAWN_SIDE * DRAWN_SIDE)
+    };
+    log::debug!(
+        "drawn check: window average alpha {}, blue {}, green {}, red {}",
+        avg(&window, 3),
+        avg(&window, 0),
+        avg(&window, 1),
+        avg(&window, 2)
+    );
+    if !opaque(&window) {
+        return Some(false);
+    }
+    let Some((output_idx, (x, y, w, h))) = screen else {
+        return Some(true);
+    };
+    let Grab::Frame(shown) = grab_frame(
+        ff,
+        &format!(
+            "ddagrab=output_idx={output_idx}:framerate=30:draw_mouse=0:             video_size={w}x{h}:offset_x={x}:offset_y={y},{shrink}"
+        ),
+    ) else {
+        log::debug!("drawn check: no frame from the screen; going by the window alone");
+        return Some(true);
+    };
+    let diff = mismatch(&window, &shown);
+    log::debug!(
+        "drawn check: screen average blue {}, green {}, red {}; difference {diff}",
+        avg(&shown, 0),
+        avg(&shown, 1),
+        avg(&shown, 2)
+    );
+    Some(diff <= SCREEN_MISMATCH)
+}
+
+enum Grab {
+    Frame(Vec<u8>),
+    TimedOut,
+    Failed,
+}
+
+/// One shrunk BGRA frame from the filter chain `chain`; waits up to ~3 s.
+fn grab_frame(ff: &Ffmpeg, chain: &str) -> Grab {
+    let size = DRAWN_SIDE * DRAWN_SIDE * 4;
+    let child = ff
+        .command()
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-init_hw_device",
+            "d3d11va=gc",
+            "-filter_hw_device",
+            "gc",
+            "-filter_complex",
+            &format!("{chain}[v]"),
+            "-map",
+            "[v]",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return Grab::Failed;
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Grab::Failed;
+    };
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let mut frame = reader.join().unwrap_or_default();
+    match status {
+        None => Grab::TimedOut,
+        Some(s) if s.success() && frame.len() >= size => {
+            frame.truncate(size);
+            Grab::Frame(frame)
+        }
+        Some(_) => Grab::Failed,
+    }
+}
+
+/// Average per-channel colour difference (0-255) of two BGRA frames,
+/// ignoring alpha.
+fn mismatch(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len()) / 4 * 3;
+    if n == 0 {
+        return 0;
+    }
+    let sum: usize = a
+        .chunks_exact(4)
+        .zip(b.chunks_exact(4))
+        .map(|(p, q)| (0..3).map(|i| p[i].abs_diff(q[i]) as usize).sum::<usize>())
+        .sum();
+    sum / n
+}
+
+/// A BGRA frame is mostly opaque (average alpha at least half).
+fn opaque(bgra: &[u8]) -> bool {
+    let pixels = bgra.len() / 4;
+    let alpha: usize = bgra.chunks_exact(4).map(|p| p[3] as usize).sum();
+    pixels > 0 && alpha >= pixels * 128
 }
 
 /// Whether `hwnd` sends frames to Windows Graphics Capture right now (a
@@ -520,4 +708,37 @@ pub fn window_sends_frames(ff: &Ffmpeg, hwnd: u64) -> bool {
     let _ = child.kill();
     let _ = child.wait();
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mismatch, opaque};
+
+    #[test]
+    fn transparent_frames_are_not_drawn() {
+        let px = |a: u8| [10u8, 20, 30, a];
+        let frame = |a: u8| px(a).repeat(32 * 32);
+        assert!(!opaque(&frame(0)));
+        assert!(!opaque(&frame(100)));
+        assert!(opaque(&frame(255)));
+        // A quarter see-through still counts as drawn (HUD-less corners).
+        let mut mixed = frame(255);
+        for p in mixed.chunks_exact_mut(4).take(32 * 8) {
+            p[3] = 0;
+        }
+        assert!(opaque(&mixed));
+        assert!(!opaque(&[]));
+    }
+
+    #[test]
+    fn screen_showing_something_else_is_a_mismatch() {
+        let frame = |b: u8, g: u8, r: u8| [b, g, r, 255].repeat(32 * 32);
+        // Black game window vs the Steam library behind it.
+        assert!(mismatch(&frame(0, 0, 0), &frame(60, 45, 40)) > super::SCREEN_MISMATCH);
+        // Same picture, small encoder/overlay differences.
+        assert!(mismatch(&frame(100, 90, 80), &frame(104, 88, 85)) <= super::SCREEN_MISMATCH);
+        // Alpha is ignored.
+        assert_eq!(mismatch(&[1, 2, 3, 0], &[1, 2, 3, 255]), 0);
+        assert_eq!(mismatch(&[], &[]), 0);
+    }
 }
